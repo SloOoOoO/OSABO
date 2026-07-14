@@ -1,38 +1,38 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-    SPC Server Dashboard — zero-dependency WPF monitor for SPC servers.
+    SPC Server Dashboard - zero-dependency WPF monitor for SPC servers.
 .DESCRIPTION
     Reads the server list directly from the .xlsm (ZIP+XML, no Excel needed),
     pings all servers in parallel, and launches UltraVNC connections.
     Edit the $Config block below to customise paths and settings.
 #>
 
-# ════════════════════════════ CONFIGURATION ══════════════════════════════════
+# ============================ CONFIGURATION ==================================
 $script:Config = @{
-    # Path to the Excel workbook (defaults to same folder as this script)
-    ExcelFile          = Join-Path $PSScriptRoot "SPC-Gerätenliste_Gesamt_NEU.xlsm"
-    # Sheet index (1-based). Sheet 1 = "Handmessplätze 09.08.2023"
+    # Path to the Excel workbook (defaults to the first .xlsm next to this script)
+    ExcelFile          = Join-Path $PSScriptRoot "SPC-Geraeteliste_Gesamt_NEU.xlsm"
+    # Sheet index (1-based). Sheet 1 = "Handmessplaetze 09.08.2023"
     SheetIndex         = 1
     # First data row (rows 1-2 are headers)
     DataStartRow       = 3
     # UltraVNC executable path
     VncExe             = "C:\Legacy\UltraVNC\UltraVNC-Viewer.exe"
-    # VNC password — DO NOT commit a real password; set it here or via env var $env:VNC_PASSWORD
+    # VNC password - DO NOT commit a real password; set it here or via env var $env:VNC_PASSWORD
     VncPassword        = if ($env:VNC_PASSWORD) { $env:VNC_PASSWORD } else { "CHANGE_ME" }
     # Auto-refresh interval in seconds (0 = disabled)
     AutoRefreshSeconds = 30
     # Per-host ping timeout in milliseconds
     PingTimeoutMs      = 1500
 }
-# ═════════════════════════════════════════════════════════════════════════════
+# ============================================================================
 
 Set-StrictMode -Off
 Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 Add-Type -AssemblyName System.Net.NetworkInformation -ErrorAction SilentlyContinue
 
-# ─── ServerItem: INotifyPropertyChanged so WPF bindings update automatically ──
+# --- ServerItem: INotifyPropertyChanged so WPF bindings update automatically ---
 if (-not ('ServerItem' -as [type])) {
     Add-Type @"
 using System;
@@ -75,7 +75,7 @@ public class ServerItem : INotifyPropertyChanged {
 
     public string LatencyText {
         get {
-            if (_status == "checking") return "—";
+            if (_status == "checking") return "-";
             if (_status == "offline" || _latency < 0) return "offline";
             return _latency.ToString() + " ms";
         }
@@ -90,7 +90,22 @@ public class ServerItem : INotifyPropertyChanged {
 "@
 }
 
-# ══════════════════════ EXCEL PARSING (ZIP + XML) ════════════════════════════
+# ====================== EXCEL PARSING (ZIP + XML) ============================
+function Resolve-ExcelFilePath {
+    $configuredPath = $script:Config.ExcelFile
+    if ($configuredPath -and (Test-Path -LiteralPath $configuredPath)) {
+        return $configuredPath
+    }
+
+    $fallback = Get-ChildItem -LiteralPath $PSScriptRoot -Filter '*.xlsm' -File -ErrorAction SilentlyContinue |
+        Select-Object -First 1
+    if ($fallback) {
+        return $fallback.FullName
+    }
+
+    return $configuredPath
+}
+
 function ConvertFrom-ColLetter ([string]$letters) {
     $letters = $letters.ToUpper()
     $idx = 0
@@ -120,7 +135,7 @@ function Read-ExcelServers {
     try {
         $zip = [IO.Compression.ZipFile]::OpenRead($tmp)
 
-        # ── Shared strings ──────────────────────────────────────────────────
+        # -- Shared strings --------------------------------------------------
         $ss = @()
         $ssEntry = $zip.Entries | Where-Object FullName -eq 'xl/sharedStrings.xml' | Select-Object -First 1
         if ($ssEntry) {
@@ -133,7 +148,7 @@ function Read-ExcelServers {
             }
         }
 
-        # ── Sheet XML ───────────────────────────────────────────────────────
+        # -- Sheet XML -------------------------------------------------------
         $sheetName = "xl/worksheets/sheet$($script:Config.SheetIndex).xml"
         $shEntry   = $zip.Entries | Where-Object FullName -eq $sheetName | Select-Object -First 1
         if (-not $shEntry) { $zip.Dispose(); return @() }
@@ -196,7 +211,7 @@ function Read-ExcelServers {
     }
 }
 
-# ═══════════════════════════ PARALLEL PING ═══════════════════════════════════
+# ========================== PARALLEL PING ===================================
 function Start-PingAll {
     param([System.Collections.ObjectModel.ObservableCollection[object]]$Collection)
 
@@ -252,7 +267,7 @@ function Start-PingAll {
     $script:PingAsyncResult = $ps.BeginInvoke()
 }
 
-# ═══════════════════════════════ COLUMN MAP ══════════════════════════════════
+# =============================== COLUMN MAP ==================================
 $script:ColumnDefs = @(
     @{ Label = 'SPC-Nr.';              Index = 0  }
     @{ Label = 'Typ';                  Index = 1  }
@@ -264,16 +279,16 @@ $script:ColumnDefs = @(
     @{ Label = 'Tisch-Nr.';            Index = 7  }
     @{ Label = 'PTM';                  Index = 8  }
     @{ Label = 'Serien-Nr.';           Index = 9  }
-    @{ Label = 'Prüfplan / Messprog.'; Index = 10 }
+    @{ Label = 'Pruefplan / Messprog.'; Index = 10 }
     @{ Label = 'Kanal-Belegung Anz.';  Index = 11 }
     @{ Label = 'Kanal belegt';         Index = 12 }
     @{ Label = 'Sonder-HW';            Index = 13 }
     @{ Label = 'Anwahlbox';            Index = 14 }
     @{ Label = 'Windows-Version';      Index = 15 }
-    @{ Label = 'IR-57 Sichtprüfung';   Index = 16 }
-    @{ Label = 'Filter / Lüfter';      Index = 17 }
-    @{ Label = 'NW-fähig';             Index = 18 }
-    @{ Label = 'Anzahl Prüfplan';      Index = 19 }
+    @{ Label = 'IR-57 Sichtpruefung';  Index = 16 }
+    @{ Label = 'Filter / Luefter';     Index = 17 }
+    @{ Label = 'NW-faehig';            Index = 18 }
+    @{ Label = 'Anzahl Pruefplan';     Index = 19 }
     @{ Label = 'Daten gesichert';      Index = 20 }
     @{ Label = 'Daten upload';         Index = 21 }
     @{ Label = 'Datenmanager';         Index = 22 }
@@ -285,7 +300,7 @@ $script:ColumnDefs = @(
     @{ Label = 'Green Gate korrekt';   Index = 28 }
 )
 
-# ═══════════════════════════════════ XAML ════════════════════════════════════
+# ================================== XAML =====================================
 [xml]$xaml = @'
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
@@ -443,7 +458,7 @@ $script:ColumnDefs = @(
       <RowDefinition Height="44"/>
     </Grid.RowDefinitions>
 
-    <!-- ══════════════════ HEADER ══════════════════ -->
+    <!-- ================== HEADER ================== -->
     <Border Grid.Row="0" Background="White" ZIndex="1">
       <Border.Effect>
         <DropShadowEffect BlurRadius="8" ShadowDepth="2" Direction="270"
@@ -462,14 +477,14 @@ $script:ColumnDefs = @(
         <StackPanel Grid.Column="0" VerticalAlignment="Center" Margin="0,0,28,0">
           <TextBlock Text="SPC Dashboard" FontSize="18" FontWeight="SemiBold"
                      Foreground="#1C1C1E"/>
-          <TextBlock x:Name="SubTitle" Text="Loading…" FontSize="11"
+          <TextBlock x:Name="SubTitle" Text="Loading..." FontSize="11"
                      Foreground="#8E8E93"/>
         </StackPanel>
 
         <!-- Search -->
         <Grid Grid.Column="2" VerticalAlignment="Center" Margin="0,0,10,0" Width="240">
           <TextBox x:Name="SearchBox" Style="{StaticResource SearchStyle}"/>
-          <TextBlock x:Name="SearchHint" Text="🔍  Search name or hostname…"
+          <TextBlock x:Name="SearchHint" Text="Search name or hostname..."
                      IsHitTestVisible="False" VerticalAlignment="Center"
                      Margin="12,0" Foreground="#AEAEB2" FontSize="12"/>
         </Grid>
@@ -484,11 +499,11 @@ $script:ColumnDefs = @(
 
         <!-- Refresh -->
         <Button x:Name="RefreshBtn" Grid.Column="4" Style="{StaticResource SecondaryBtn}"
-                Content="↺  Refresh" VerticalAlignment="Center"/>
+                Content="Refresh" VerticalAlignment="Center"/>
       </Grid>
     </Border>
 
-    <!-- ══════════════════ CONTENT ══════════════════ -->
+    <!-- ================== CONTENT ================== -->
     <Grid Grid.Row="1" Margin="14,14,14,6">
       <Grid.ColumnDefinitions>
         <ColumnDefinition Width="2*"/>
@@ -579,7 +594,7 @@ $script:ColumnDefs = @(
           <ScrollViewer Grid.Row="0" VerticalScrollBarVisibility="Auto"
                         Padding="18,18,18,0">
             <StackPanel x:Name="DetailContent">
-              <TextBlock Text="← Select a server" FontSize="14"
+              <TextBlock Text="<- Select a server" FontSize="14"
                          Foreground="#C7C7CC" HorizontalAlignment="Center"
                          Margin="0,80,0,0"/>
             </StackPanel>
@@ -587,7 +602,7 @@ $script:ColumnDefs = @(
 
           <Border Grid.Row="1" Padding="18,12,18,18">
             <Button x:Name="ConnectBtn" Style="{StaticResource PrimaryBtn}"
-                    Content="⬡  Connect via VNC"
+                    Content="Connect via VNC"
                     HorizontalAlignment="Stretch"
                     IsEnabled="False"/>
           </Border>
@@ -595,7 +610,7 @@ $script:ColumnDefs = @(
       </Border>
     </Grid>
 
-    <!-- ══════════════════ FOOTER ══════════════════ -->
+    <!-- ================== FOOTER ================== -->
     <Border Grid.Row="2" Background="White" Margin="0,4,0,0">
       <Border.Effect>
         <DropShadowEffect BlurRadius="6" ShadowDepth="-1" Direction="90"
@@ -609,13 +624,13 @@ $script:ColumnDefs = @(
         </Grid.ColumnDefinitions>
 
         <TextBlock x:Name="StatusBar" Grid.Column="0" VerticalAlignment="Center"
-                   FontSize="12" Foreground="#6E6E73" Text="Loading servers…"/>
+                   FontSize="12" Foreground="#6E6E73" Text="Loading servers..."/>
 
         <TextBlock x:Name="AutoRefreshLbl" Grid.Column="1" VerticalAlignment="Center"
                    FontSize="11" Foreground="#AEAEB2" Margin="0,0,22,0"/>
 
         <Button x:Name="CreditBtn" Grid.Column="2" Style="{StaticResource CreditBtn}"
-                Content="ℹ  ssari9@ford.com  ·  contact: ithelp@ford.com"
+                Content="i  ssari9@ford.com  -  contact: ithelp@ford.com"
                 VerticalAlignment="Center"/>
       </Grid>
     </Border>
@@ -624,7 +639,7 @@ $script:ColumnDefs = @(
 </Window>
 '@
 
-# ════════════════════════ LOAD WINDOW ════════════════════════════════════════
+# =============================== LOAD WINDOW =================================
 $reader = New-Object System.Xml.XmlNodeReader($xaml)
 $window = [System.Windows.Markup.XamlReader]::Load($reader)
 
@@ -654,13 +669,13 @@ $script:SelectedItem        = $null
 $script:DetailStatusDot     = $null
 $script:DetailStatusText    = $null
 
-# ═══════════════════ HELPER: colour string -> Brush ═══════════════════════════
+# =================== HELPER: colour string -> Brush ===========================
 function New-Brush([string]$hex) {
     $c = [System.Windows.Media.ColorConverter]::ConvertFromString($hex)
     return [System.Windows.Media.SolidColorBrush]::new($c)
 }
 
-# ════════════════════ DETAIL PANEL ═══════════════════════════════════════════
+# ============================ DETAIL PANEL ===================================
 function Update-DetailPanel {
     param($item)
 
@@ -671,7 +686,7 @@ function Update-DetailPanel {
 
     if (-not $item) {
         $ph = New-Object System.Windows.Controls.TextBlock
-        $ph.Text = "← Select a server"
+        $ph.Text = "<- Select a server"
         $ph.FontSize = 14
         $ph.Foreground = New-Brush '#C7C7CC'
         $ph.HorizontalAlignment = 'Center'
@@ -740,9 +755,9 @@ function Get-StatusColor([string]$status) {
 
 function Get-StatusText($item) {
     switch ($item.Status) {
-        'online'  { return "Online  ·  $($item.LatencyMs) ms" }
+        'online'  { return "Online - $($item.LatencyMs) ms" }
         'offline' { return 'Offline' }
-        default   { return 'Checking…' }
+        default   { return 'Checking...' }
     }
 }
 
@@ -787,24 +802,25 @@ function Refresh-DetailStatus {
     $script:DetailStatusText.Foreground = $color
 }
 
-# ════════════════════════ STATUS BAR ═════════════════════════════════════════
+# =============================== STATUS BAR ==================================
 function Update-StatusBar {
     $total    = $script:ServerCollection.Count
     $online   = ($script:ServerCollection | Where-Object Status -eq 'online').Count
     $offline  = ($script:ServerCollection | Where-Object Status -eq 'offline').Count
     $checking = ($script:ServerCollection | Where-Object Status -eq 'checking').Count
 
-    $text = "$total servers  ·  "
-    $text += "$online online  ·  $offline offline"
-    if ($checking -gt 0) { $text += "  ·  $checking checking…" }
+    $text = "$total servers - "
+    $text += "$online online - $offline offline"
+    if ($checking -gt 0) { $text += " - $checking checking..." }
     $statusBar.Text = $text
     $subTitle.Text  = "$online / $total online"
 }
 
-# ════════════════════════ SORT / FILTER ══════════════════════════════════════
+# ============================== SORT / FILTER =================================
 function Apply-Sort {
     $script:CollView.SortDescriptions.Clear()
-    $tag = ($sortCombo.SelectedItem -as [System.Windows.Controls.ComboBoxItem])?.Tag
+    $selectedSortItem = $sortCombo.SelectedItem -as [System.Windows.Controls.ComboBoxItem]
+    $tag = if ($selectedSortItem) { $selectedSortItem.Tag } else { $null }
     if (-not $tag) { $tag = 'Name' }
     switch ($tag) {
         'Name'    { $script:CollView.SortDescriptions.Add([System.ComponentModel.SortDescription]::new('DisplayName',[System.ComponentModel.ListSortDirection]::Ascending)) }
@@ -829,10 +845,11 @@ function Apply-Filter {
     }
 }
 
-# ════════════════════════ LOAD / RELOAD ══════════════════════════════════════
+# ============================== LOAD / RELOAD =================================
 function Load-Servers {
-    $statusBar.Text = "Reading Excel file…"
-    $items = Read-ExcelServers -Path $script:Config.ExcelFile
+    $statusBar.Text = "Reading Excel file..."
+    $excelPath = Resolve-ExcelFilePath
+    $items = Read-ExcelServers -Path $excelPath
     $script:ServerCollection.Clear()
     $script:ServerLookup.Clear()
     $prevSelected = $null
@@ -849,7 +866,7 @@ function Load-Servers {
 
 function Refresh-All {
     $refreshBtn.IsEnabled = $false
-    $refreshBtn.Content   = "↺  Refreshing…"
+    $refreshBtn.Content   = "Refreshing..."
     try {
         $items = Load-Servers
         if ($items.Count -gt 0) {
@@ -859,11 +876,11 @@ function Refresh-All {
         }
     } finally {
         $refreshBtn.IsEnabled = $true
-        $refreshBtn.Content   = "↺  Refresh"
+        $refreshBtn.Content   = "Refresh"
     }
 }
 
-# ════════════════════════ VNC CONNECT ════════════════════════════════════════
+# ============================== VNC CONNECT ==================================
 function Connect-VNC {
     param($item)
     if (-not $item -or -not $item.Hostname) {
@@ -883,7 +900,7 @@ function Connect-VNC {
     Start-Process -FilePath $script:Config.VncExe -ArgumentList "-password `"$pw`" -connect $host"
 }
 
-# ═══════════════════════════ EVENT HANDLERS ══════════════════════════════════
+# ============================== EVENT HANDLERS ===============================
 
 # Search box
 $searchBox.Add_TextChanged({
@@ -897,12 +914,12 @@ $sortCombo.Add_SelectionChanged({ Apply-Sort })
 # Refresh button
 $refreshBtn.Add_Click({ Refresh-All })
 
-# List selection → update detail panel
+# List selection -> update detail panel
 $serverList.Add_SelectionChanged({
     Update-DetailPanel ($serverList.SelectedItem -as [ServerItem])
 })
 
-# Double-click → connect
+# Double-click -> connect
 $serverList.Add_MouseDoubleClick({
     $item = $serverList.SelectedItem -as [ServerItem]
     if ($item) { Connect-VNC $item }
@@ -913,14 +930,14 @@ $connectBtn.Add_Click({
     Connect-VNC ($serverList.SelectedItem -as [ServerItem])
 })
 
-# Credit button → message box
+# Credit button -> message box
 $creditBtn.Add_Click({
     [System.Windows.MessageBox]::Show(
         "SPC Server Dashboard`n`nDeveloped by: ssari9@ford.com`nSupport: ithelp@ford.com",
         "About", "OK", "Information") | Out-Null
 })
 
-# ════════════════ TIMERS ══════════════════════════════════════════════════════
+# ================================ TIMERS =====================================
 
 # Poll ping results every 200 ms and update UI
 $pingTimer = New-Object System.Windows.Threading.DispatcherTimer
@@ -963,10 +980,10 @@ if ($script:Config.AutoRefreshSeconds -gt 0) {
     $autoRefLbl.Text = "Auto-refresh: off"
 }
 
-# ════════════════ FILE WATCHER (auto-reload when Excel changes) ═══════════════
+# ================= FILE WATCHER (auto-reload when Excel changes) ==============
 $script:WatcherRegistered = $false
 function Register-FileWatcher {
-    $excelPath = $script:Config.ExcelFile
+    $excelPath = Resolve-ExcelFilePath
     if (-not (Test-Path $excelPath)) { return }
 
     $dir  = [IO.Path]::GetDirectoryName($excelPath)
@@ -980,7 +997,7 @@ function Register-FileWatcher {
         -EventName Changed -SourceIdentifier 'SPC_ExcelChanged' -Action {
         Start-Sleep -Seconds 2   # wait for Excel to finish writing
         $window.Dispatcher.Invoke([action]{
-            $statusBar.Text = "Excel file changed — reloading…"
+            $statusBar.Text = "Excel file changed - reloading..."
             $items = Load-Servers
             if ($items.Count -gt 0) { Start-PingAll -Collection $script:ServerCollection }
         })
@@ -988,7 +1005,7 @@ function Register-FileWatcher {
     $script:WatcherRegistered = $true
 }
 
-# ════════════════ WINDOW EVENTS ═══════════════════════════════════════════════
+# ============================= WINDOW EVENTS ==================================
 $window.Add_Loaded({
     Refresh-All
     Register-FileWatcher
@@ -1009,5 +1026,5 @@ $window.Add_Closed({
     }
 })
 
-# ════════════════ SHOW ════════════════════════════════════════════════════════
+# ================================= SHOW ======================================
 [void]$window.ShowDialog()

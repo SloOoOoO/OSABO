@@ -1,0 +1,40 @@
+name: Validate PowerShell 5.1
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  parse-script:
+    runs-on: windows-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Ensure SPC-Dashboard.ps1 is ASCII-only
+        shell: powershell
+        run: |
+          $scriptPath = Join-Path $env:GITHUB_WORKSPACE 'SPC-Dashboard.ps1'
+          $bytes = [System.IO.File]::ReadAllBytes($scriptPath)
+          $nonAscii = $bytes | Where-Object { $_ -gt 127 }
+          if ($nonAscii.Count -gt 0) {
+              throw "SPC-Dashboard.ps1 contains non-ASCII bytes."
+          }
+
+      - name: Parse with Windows PowerShell 5.1
+        shell: powershell
+        run: |
+          $scriptPath = Join-Path $env:GITHUB_WORKSPACE 'SPC-Dashboard.ps1'
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile($scriptPath, [ref]$null, [ref]$errors) > $null
+          if ($errors.Count -gt 0) {
+              $errors | ForEach-Object {
+                  Write-Error ("Line {0}: {1}" -f $_.Extent.StartLineNumber, $_.Message)
+              }
+              throw "Parser found $($errors.Count) error(s)."
+          }
