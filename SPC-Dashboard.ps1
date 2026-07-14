@@ -594,7 +594,7 @@ $script:ColumnDefs = @(
           <ScrollViewer Grid.Row="0" VerticalScrollBarVisibility="Auto"
                         Padding="18,18,18,0">
             <StackPanel x:Name="DetailContent">
-              <TextBlock Text="<- Select a server" FontSize="14"
+              <TextBlock Text="&lt;- Select a server" FontSize="14"
                          Foreground="#C7C7CC" HorizontalAlignment="Center"
                          Margin="0,80,0,0"/>
             </StackPanel>
