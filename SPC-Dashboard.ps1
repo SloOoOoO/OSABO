@@ -508,19 +508,14 @@ $script:ColumnDefs = @(
       <Setter Property="Template">
         <Setter.Value>
           <ControlTemplate TargetType="Button">
-            <Border Background="{TemplateBinding Background}" Padding="{TemplateBinding Padding}">
-              <ContentPresenter x:Name="Cp"
-                                Content="{TemplateBinding Content}"
-                                HorizontalAlignment="Left"
-                                VerticalAlignment="Center"
-                                RecognizesAccessKey="True"
-                                TextElement.Foreground="{TemplateBinding Foreground}"
-                                TextElement.FontSize="{TemplateBinding FontSize}"/>
-            </Border>
+            <TextBlock x:Name="Tb" Text="{TemplateBinding Content}"
+                       Foreground="{TemplateBinding Foreground}"
+                       FontSize="{TemplateBinding FontSize}"
+                       VerticalAlignment="Center"/>
             <ControlTemplate.Triggers>
               <Trigger Property="IsMouseOver" Value="True">
-                <Setter TargetName="Cp" Property="TextElement.Foreground"      Value="#007AFF"/>
-                <Setter TargetName="Cp" Property="TextElement.TextDecorations" Value="Underline"/>
+                <Setter TargetName="Tb" Property="Foreground"        Value="#007AFF"/>
+                <Setter TargetName="Tb" Property="TextDecorations"   Value="Underline"/>
               </Trigger>
             </ControlTemplate.Triggers>
           </ControlTemplate>
