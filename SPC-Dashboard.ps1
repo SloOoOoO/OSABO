@@ -4,7 +4,7 @@
     SPC Server Dashboard - zero-dependency WPF monitor for SPC servers.
 .DESCRIPTION
     Reads the server list directly from the .xlsm (ZIP+XML, no Excel needed),
-    pings all servers in parallel, and launches UltraVNC connections.
+    checks servers in parallel, and launches UltraVNC connections.
     Edit the $Config block below to customise paths and settings.
 #>
 
@@ -24,6 +24,12 @@ $script:Config = @{
     AutoRefreshSeconds = 30
     # Per-host ping timeout in milliseconds
     PingTimeoutMs      = 1500
+    # Fallback VNC port check when ICMP is blocked
+    TcpFallbackPort    = 5900
+    # Fallback TCP timeout in milliseconds
+    TcpFallbackTimeoutMs = 500
+    # Excel column containing MAC addresses for Wake-on-LAN (default: AA / column 27)
+    MacAddressColumn   = 'AA'
 }
 # ============================================================================
 
@@ -114,6 +120,26 @@ function ConvertFrom-ColLetter ([string]$letters) {
     }
     return $idx - 1   # 0-based
 }
+
+function Get-ConfiguredColumnIndex([object]$Value, [int]$DefaultIndex) {
+    if ($null -eq $Value) { return $DefaultIndex }
+
+    $text = [string]$Value
+    if ([string]::IsNullOrWhiteSpace($text)) { return $DefaultIndex }
+
+    $text = $text.Trim()
+    if ($text -match '^\d+$') {
+        return [int]$text
+    }
+    if ($text -match '^[A-Za-z]+$') {
+        return ConvertFrom-ColLetter $text
+    }
+
+    Write-Warning "Invalid column mapping '$text'. Falling back to column index $DefaultIndex."
+    return $DefaultIndex
+}
+
+$script:MacAddressColumnIndex = Get-ConfiguredColumnIndex $script:Config.MacAddressColumn 26
 
 function Read-ExcelServers {
     param([string]$Path)
@@ -216,22 +242,31 @@ function Start-PingAll {
     param([System.Collections.ObjectModel.ObservableCollection[object]]$Collection)
 
     # Mark all as checking
-    foreach ($item in $Collection) { $item.Status = 'checking' }
+    foreach ($item in $Collection) {
+        $item.Status = 'checking'
+        $item.LatencyMs = -1L
+    }
 
     if ($script:PingRunspace) {
         try { $script:PingRunspace.Close(); $script:PingRunspace.Dispose() } catch {}
     }
+    if ($script:PingPS) {
+        try { $script:PingPS.Dispose() } catch {}
+    }
 
     $script:PingQueue = [System.Collections.Concurrent.ConcurrentQueue[hashtable]]::new()
+    Update-StatusBar
 
     # Build a plain array to pass to the runspace (avoid serialization issues)
     $hostList = @($Collection | Where-Object { $_.Hostname } |
-                    ForEach-Object { @{ Name = $_.DisplayName; Host = $_.Hostname } })
+                    ForEach-Object { @{ Host = $_.Hostname } })
 
     $rs = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace()
     $rs.Open()
     $rs.SessionStateProxy.SetVariable('hostList',   $hostList)
     $rs.SessionStateProxy.SetVariable('timeoutMs',  $script:Config.PingTimeoutMs)
+    $rs.SessionStateProxy.SetVariable('tcpPort',    $script:Config.TcpFallbackPort)
+    $rs.SessionStateProxy.SetVariable('tcpTimeoutMs', $script:Config.TcpFallbackTimeoutMs)
     $rs.SessionStateProxy.SetVariable('resultQueue',$script:PingQueue)
 
     $ps = [System.Management.Automation.PowerShell]::Create()
@@ -241,24 +276,63 @@ function Start-PingAll {
         $tasks = [System.Collections.Generic.List[object]]::new()
         foreach ($entry in $hostList) {
             $ping = [System.Net.NetworkInformation.Ping]::new()
-            $tasks.Add([pscustomobject]@{
-                Task = $ping.SendPingAsync($entry.Host, $timeoutMs)
-                Ping = $ping
-                Name = $entry.Name
-            })
+            try {
+                $tasks.Add([pscustomobject]@{
+                    Task = $ping.SendPingAsync($entry.Host, $timeoutMs)
+                    Ping = $ping
+                    Host = $entry.Host
+                })
+            } catch {
+                $resultQueue.Enqueue(@{
+                    Host    = $entry.Host
+                    Status  = 'offline'
+                    Latency = -1L
+                })
+                $ping.Dispose()
+            }
         }
+        $tcpTasks = [System.Collections.Generic.List[object]]::new()
         foreach ($t in $tasks) {
             try {
                 $reply = $t.Task.GetAwaiter().GetResult()
-                $resultQueue.Enqueue(@{
-                    Name    = $t.Name
-                    Status  = if ($reply.Status -eq 'Success') { 'online' } else { 'offline' }
-                    Latency = if ($reply.Status -eq 'Success') { $reply.RoundtripTime } else { -1L }
-                })
             } catch {
-                $resultQueue.Enqueue(@{ Name = $t.Name; Status = 'offline'; Latency = -1L })
+                $reply = $null
+            }
+            if ($reply -and $reply.Status -eq [System.Net.NetworkInformation.IPStatus]::Success) {
+                $resultQueue.Enqueue(@{
+                    Host    = $t.Host
+                    Status  = 'online'
+                    Latency = [int64]$reply.RoundtripTime
+                })
+            } else {
+                $client = New-Object System.Net.Sockets.TcpClient
+                $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+                $tcpTasks.Add([pscustomobject]@{
+                    Host      = $t.Host
+                    Client    = $client
+                    Connect   = $client.ConnectAsync($t.Host, $tcpPort)
+                    Stopwatch = $stopwatch
+                })
             }
             $t.Ping.Dispose()
+        }
+        foreach ($t in $tcpTasks) {
+            $isOnline = $false
+            $latency = -1L
+            try {
+                if ($t.Connect.Wait($tcpTimeoutMs) -and $t.Client.Connected) {
+                    $isOnline = $true
+                    $latency = [int64][Math]::Max(1, [Math]::Round($t.Stopwatch.Elapsed.TotalMilliseconds))
+                }
+            } catch {}
+            $t.Stopwatch.Stop()
+            try { $t.Client.Close() } catch {}
+            try { $t.Client.Dispose() } catch {}
+            $resultQueue.Enqueue(@{
+                Host    = $t.Host
+                Status  = if ($isOnline) { 'online' } else { 'offline' }
+                Latency = $latency
+            })
         }
     })
 
@@ -295,7 +369,7 @@ $script:ColumnDefs = @(
     @{ Label = 'Greengate';            Index = 23 }
     @{ Label = 'Bemerkung';            Index = 24 }
     @{ Label = 'Hostname';             Index = 25 }
-    @{ Label = 'MAC-Adresse';          Index = 26 }
+    @{ Label = 'MAC-Adresse';          Index = $script:MacAddressColumnIndex }
     @{ Label = 'Serien-Nr. USB';       Index = 27 }
     @{ Label = 'Green Gate korrekt';   Index = 28 }
 )
@@ -434,14 +508,19 @@ $script:ColumnDefs = @(
       <Setter Property="Template">
         <Setter.Value>
           <ControlTemplate TargetType="Button">
-            <TextBlock x:Name="Tb" Text="{TemplateBinding Content}"
-                       Foreground="{TemplateBinding Foreground}"
-                       FontSize="{TemplateBinding FontSize}"
-                       VerticalAlignment="Center"/>
+            <Border Background="{TemplateBinding Background}" Padding="{TemplateBinding Padding}">
+              <ContentPresenter x:Name="Cp"
+                                Content="{TemplateBinding Content}"
+                                HorizontalAlignment="Left"
+                                VerticalAlignment="Center"
+                                RecognizesAccessKey="True"
+                                TextElement.Foreground="{TemplateBinding Foreground}"
+                                TextElement.FontSize="{TemplateBinding FontSize}"/>
+            </Border>
             <ControlTemplate.Triggers>
               <Trigger Property="IsMouseOver" Value="True">
-                <Setter TargetName="Tb" Property="Foreground"       Value="#007AFF"/>
-                <Setter TargetName="Tb" Property="TextDecorations"  Value="Underline"/>
+                <Setter TargetName="Cp" Property="TextElement.Foreground"      Value="#007AFF"/>
+                <Setter TargetName="Cp" Property="TextElement.TextDecorations" Value="Underline"/>
               </Trigger>
             </ControlTemplate.Triggers>
           </ControlTemplate>
@@ -459,7 +538,7 @@ $script:ColumnDefs = @(
     </Grid.RowDefinitions>
 
     <!-- ================== HEADER ================== -->
-    <Border Grid.Row="0" Background="White" ZIndex="1">
+    <Border Grid.Row="0" Background="White" Panel.ZIndex="1">
       <Border.Effect>
         <DropShadowEffect BlurRadius="8" ShadowDepth="2" Direction="270"
                           Color="#000000" Opacity="0.07"/>
@@ -601,10 +680,19 @@ $script:ColumnDefs = @(
           </ScrollViewer>
 
           <Border Grid.Row="1" Padding="18,12,18,18">
-            <Button x:Name="ConnectBtn" Style="{StaticResource PrimaryBtn}"
-                    Content="Connect via VNC"
-                    HorizontalAlignment="Stretch"
-                    IsEnabled="False"/>
+            <Grid>
+              <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="10"/>
+                <ColumnDefinition Width="*"/>
+              </Grid.ColumnDefinitions>
+              <Button x:Name="WakeBtn" Grid.Column="0" Style="{StaticResource SecondaryBtn}"
+                      Content="Wake" MinWidth="88" IsEnabled="False"/>
+              <Button x:Name="ConnectBtn" Grid.Column="2" Style="{StaticResource PrimaryBtn}"
+                      Content="Connect via VNC"
+                      HorizontalAlignment="Stretch"
+                      IsEnabled="False"/>
+            </Grid>
           </Border>
         </Grid>
       </Border>
@@ -630,7 +718,7 @@ $script:ColumnDefs = @(
                    FontSize="11" Foreground="#AEAEB2" Margin="0,0,22,0"/>
 
         <Button x:Name="CreditBtn" Grid.Column="2" Style="{StaticResource CreditBtn}"
-                Content="i  ssari9@ford.com  -  contact: ithelp@ford.com"
+                Content="credits: ssari9@ford.com  contact: ithelp@ford.com"
                 VerticalAlignment="Center"/>
       </Grid>
     </Border>
@@ -651,6 +739,7 @@ $sortCombo     = $window.FindName('SortCombo')
 $refreshBtn    = $window.FindName('RefreshBtn')
 $serverList    = $window.FindName('ServerList')
 $detailContent = $window.FindName('DetailContent')
+$wakeBtn       = $window.FindName('WakeBtn')
 $connectBtn    = $window.FindName('ConnectBtn')
 $statusBar     = $window.FindName('StatusBar')
 $autoRefLbl    = $window.FindName('AutoRefreshLbl')
@@ -661,18 +750,107 @@ $script:ServerCollection = New-Object System.Collections.ObjectModel.ObservableC
 $serverList.ItemsSource  = $script:ServerCollection
 $script:CollView         = [System.Windows.Data.CollectionViewSource]::GetDefaultView($script:ServerCollection)
 
-# Fast lookup: DisplayName -> ServerItem
+# Fast lookup: Hostname -> ServerItem list
 $script:ServerLookup = @{}
 
 # Track selected item for detail panel refresh
 $script:SelectedItem        = $null
 $script:DetailStatusDot     = $null
 $script:DetailStatusText    = $null
+$script:StatusMessage       = $null
+$script:StatusMessageTimer  = New-Object System.Windows.Threading.DispatcherTimer
+$script:StatusMessageTimer.Interval = [TimeSpan]::FromSeconds(5)
+$script:StatusMessageTimer.Add_Tick({
+    $script:StatusMessageTimer.Stop()
+    $script:StatusMessage = $null
+    Update-StatusBar
+})
 
 # =================== HELPER: colour string -> Brush ===========================
 function New-Brush([string]$hex) {
     $c = [System.Windows.Media.ColorConverter]::ConvertFromString($hex)
     return [System.Windows.Media.SolidColorBrush]::new($c)
+}
+
+function Get-HostLookupKey([string]$Hostname) {
+    if ([string]::IsNullOrWhiteSpace($Hostname)) { return $null }
+    return $Hostname.Trim().ToLowerInvariant()
+}
+
+function Get-ItemMacAddress($item) {
+    if (-not $item -or -not $item.RawData) { return $null }
+    if (-not $item.RawData.Contains($script:MacAddressColumnIndex)) { return $null }
+
+    $value = [string]$item.RawData[$script:MacAddressColumnIndex]
+    if ([string]::IsNullOrWhiteSpace($value)) { return $null }
+    return $value.Trim()
+}
+
+function Update-ActionButtons($item) {
+    $connectBtn.IsEnabled = [bool]($item -and $item.Hostname)
+    $wakeBtn.IsEnabled = [bool]($item -and $item.Status -eq 'offline' -and (Get-ItemMacAddress $item))
+}
+
+function Show-StatusMessage([string]$message) {
+    $script:StatusMessage = $message
+    Update-StatusBar
+    $script:StatusMessageTimer.Stop()
+    $script:StatusMessageTimer.Start()
+}
+
+function ConvertTo-MacBytes([string]$MacAddress) {
+    if ([string]::IsNullOrWhiteSpace($MacAddress)) { return $null }
+
+    $hex = ($MacAddress -replace '[^0-9A-Fa-f]', '').ToUpperInvariant()
+    if ($hex.Length -ne 12) { return $null }
+
+    $bytes = New-Object byte[] 6
+    for ($i = 0; $i -lt 6; $i++) {
+        $bytes[$i] = [Convert]::ToByte($hex.Substring($i * 2, 2), 16)
+    }
+    return $bytes
+}
+
+function Send-WakeOnLan([string]$MacAddress) {
+    $macBytes = ConvertTo-MacBytes $MacAddress
+    if (-not $macBytes) {
+        throw "Invalid MAC address: $MacAddress"
+    }
+
+    $packet = New-Object byte[] 102
+    for ($i = 0; $i -lt 6; $i++) {
+        $packet[$i] = 0xFF
+    }
+    for ($i = 6; $i -lt $packet.Length; $i += 6) {
+        [System.Buffer]::BlockCopy($macBytes, 0, $packet, $i, 6)
+    }
+
+    $client = New-Object System.Net.Sockets.UdpClient
+    try {
+        $client.EnableBroadcast = $true
+        [void]$client.Send($packet, $packet.Length, '255.255.255.255', 9)
+    } finally {
+        try { $client.Close() } catch {}
+        try { $client.Dispose() } catch {}
+    }
+}
+
+function Invoke-WakeServer($item) {
+    if (-not $item) { return }
+
+    $macAddress = Get-ItemMacAddress $item
+    if (-not $macAddress) {
+        Show-StatusMessage "Wake-on-LAN unavailable: no MAC address configured."
+        return
+    }
+
+    try {
+        Send-WakeOnLan $macAddress
+        $targetName = if ($item.Hostname) { $item.Hostname } else { $item.DisplayName }
+        Show-StatusMessage "WOL packet sent to $targetName."
+    } catch {
+        Show-StatusMessage "Wake-on-LAN failed: $($_.Exception.Message)"
+    }
 }
 
 # ============================ DETAIL PANEL ===================================
@@ -692,7 +870,7 @@ function Update-DetailPanel {
         $ph.HorizontalAlignment = 'Center'
         $ph.Margin = [System.Windows.Thickness]::new(0,80,0,0)
         [void]$detailContent.Children.Add($ph)
-        $connectBtn.IsEnabled = $false
+        Update-ActionButtons $null
         return
     }
 
@@ -711,7 +889,7 @@ function Update-DetailPanel {
     $statusRow.Orientation = 'Horizontal'
     $statusRow.Margin = [System.Windows.Thickness]::new(0,0,0,14)
 
-    $dot = New-Object System.Windows.Controls.Ellipse
+    $dot = New-Object System.Windows.Shapes.Ellipse
     $dot.Width  = 10
     $dot.Height = 10
     $dot.VerticalAlignment = 'Center'
@@ -742,7 +920,7 @@ function Update-DetailPanel {
         Add-DetailRow $cd.Label $val
     }
 
-    $connectBtn.IsEnabled = [bool]$item.Hostname
+    Update-ActionButtons $item
 }
 
 function Get-StatusColor([string]$status) {
@@ -800,6 +978,7 @@ function Refresh-DetailStatus {
     $script:DetailStatusDot.Fill  = $color
     $script:DetailStatusText.Text = Get-StatusText $item
     $script:DetailStatusText.Foreground = $color
+    Update-ActionButtons $item
 }
 
 # =============================== STATUS BAR ==================================
@@ -812,6 +991,7 @@ function Update-StatusBar {
     $text = "$total servers - "
     $text += "$online online - $offline offline"
     if ($checking -gt 0) { $text += " - $checking checking..." }
+    if ($script:StatusMessage) { $text += " | $script:StatusMessage" }
     $statusBar.Text = $text
     $subTitle.Text  = "$online / $total online"
 }
@@ -854,8 +1034,14 @@ function Load-Servers {
     $script:ServerLookup.Clear()
     $prevSelected = $null
     foreach ($item in $items) {
-        $script:ServerCollection.Add($item)   | Out-Null
-        $script:ServerLookup[$item.DisplayName] = $item
+        $script:ServerCollection.Add($item) | Out-Null
+        $key = Get-HostLookupKey $item.Hostname
+        if ($key) {
+            if (-not $script:ServerLookup.ContainsKey($key)) {
+                $script:ServerLookup[$key] = [System.Collections.Generic.List[object]]::new()
+            }
+            $script:ServerLookup[$key].Add($item) | Out-Null
+        }
     }
     Apply-Sort
     Apply-Filter
@@ -930,11 +1116,14 @@ $connectBtn.Add_Click({
     Connect-VNC ($serverList.SelectedItem -as [ServerItem])
 })
 
-# Credit button -> message box
+# Wake button
+$wakeBtn.Add_Click({
+    Invoke-WakeServer ($serverList.SelectedItem -as [ServerItem])
+})
+
+# Credit button -> open default mail client
 $creditBtn.Add_Click({
-    [System.Windows.MessageBox]::Show(
-        "SPC Server Dashboard`n`nDeveloped by: ssari9@ford.com`nSupport: ithelp@ford.com",
-        "About", "OK", "Information") | Out-Null
+    Start-Process "mailto:ithelp@ford.com"
 })
 
 # ================================ TIMERS =====================================
@@ -946,14 +1135,16 @@ $pingTimer.Add_Tick({
     $result = $null
     $updated = $false
     while ($script:PingQueue -and $script:PingQueue.TryDequeue([ref]$result)) {
-        $item = $script:ServerLookup[$result.Name]
-        if ($item) {
-            $item.Status    = $result.Status
-            $item.LatencyMs = $result.Latency
-            $updated = $true
-            # Refresh detail panel status if this is the selected server
-            if ($script:SelectedItem -and $script:SelectedItem.DisplayName -eq $result.Name) {
-                Refresh-DetailStatus
+        $matchedItems = $script:ServerLookup[(Get-HostLookupKey $result.Host)]
+        if ($matchedItems) {
+            foreach ($item in $matchedItems) {
+                $item.Status    = $result.Status
+                $item.LatencyMs = $result.Latency
+                $updated = $true
+                # Refresh detail panel status if this is the selected server
+                if ($script:SelectedItem -eq $item) {
+                    Refresh-DetailStatus
+                }
             }
         }
     }
