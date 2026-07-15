@@ -20,16 +20,18 @@ $script:Config = @{
     VncExe             = "C:\Legacy\UltraVNC\UltraVNC-Viewer.exe"
     # VNC password - DO NOT commit a real password; set it here or via env var $env:VNC_PASSWORD
     VncPassword        = if ($env:VNC_PASSWORD) { $env:VNC_PASSWORD } else { "CHANGE_ME" }
-    # Auto-refresh interval in seconds (0 = disabled)
-    AutoRefreshSeconds = 30
+    # DNS suffixes tried when a bare hostname does not resolve
+    DnsSuffixes        = @('', 'niehlt.gft.ford.com', 'niehl.ford.com')
+    # Target cadence for re-checking each host
+    CheckIntervalSeconds = 5
+    # Maximum number of parallel host checks
+    MaxConcurrentChecks = 25
     # Per-host ping timeout in milliseconds
     PingTimeoutMs      = 1500
     # Fallback VNC port check when ICMP is blocked
     TcpFallbackPort    = 5900
     # Fallback TCP timeout in milliseconds
     TcpFallbackTimeoutMs = 500
-    # Excel column containing MAC addresses for Wake-on-LAN (default: AA / column 27)
-    MacAddressColumn   = 'AA'
 }
 # ============================================================================
 
@@ -51,6 +53,7 @@ public class ServerItem : INotifyPropertyChanged {
 
     public string    DisplayName { get; set; }
     public string    Hostname    { get; set; }
+    public string    ResolvedHost { get; set; }
     public int       RowNumber   { get; set; }
     public Hashtable RawData     { get; set; }
 
@@ -120,26 +123,6 @@ function ConvertFrom-ColLetter ([string]$letters) {
     }
     return $idx - 1   # 0-based
 }
-
-function Get-ConfiguredColumnIndex([object]$Value, [int]$DefaultIndex) {
-    if ($null -eq $Value) { return $DefaultIndex }
-
-    $text = [string]$Value
-    if ([string]::IsNullOrWhiteSpace($text)) { return $DefaultIndex }
-
-    $text = $text.Trim()
-    if ($text -match '^\d+$') {
-        return [int]$text
-    }
-    if ($text -match '^[A-Za-z]+$') {
-        return ConvertFrom-ColLetter $text
-    }
-
-    Write-Warning "Invalid column mapping '$text'. Falling back to column index $DefaultIndex."
-    return $DefaultIndex
-}
-
-$script:MacAddressColumnIndex = Get-ConfiguredColumnIndex $script:Config.MacAddressColumn 26
 
 function Read-ExcelServers {
     param([string]$Path)
@@ -237,108 +220,252 @@ function Read-ExcelServers {
     }
 }
 
-# ========================== PARALLEL PING ===================================
-function Start-PingAll {
+# ========================== LIVE MONITOR =====================================
+function Stop-LiveMonitor {
+    if ($script:MonitorControl) {
+        $script:MonitorControl.Stop = $true
+    }
+    if ($script:MonitorRunspace) {
+        try { $script:MonitorRunspace.Close(); $script:MonitorRunspace.Dispose() } catch {}
+    }
+    if ($script:MonitorPS) {
+        try { $script:MonitorPS.Dispose() } catch {}
+    }
+    $script:MonitorAsyncResult = $null
+    $script:MonitorPS = $null
+    $script:MonitorRunspace = $null
+    $script:MonitorControl = $null
+}
+
+function Start-LiveMonitor {
     param([System.Collections.ObjectModel.ObservableCollection[object]]$Collection)
 
-    # Mark all as checking
     foreach ($item in $Collection) {
         $item.Status = 'checking'
         $item.LatencyMs = -1L
     }
 
-    if ($script:PingRunspace) {
-        try { $script:PingRunspace.Close(); $script:PingRunspace.Dispose() } catch {}
-    }
-    if ($script:PingPS) {
-        try { $script:PingPS.Dispose() } catch {}
-    }
-
     $script:PingQueue = [System.Collections.Concurrent.ConcurrentQueue[hashtable]]::new()
+    Stop-LiveMonitor
     Update-StatusBar
 
-    # Build a plain array to pass to the runspace (avoid serialization issues)
-    $hostList = @($Collection | Where-Object { $_.Hostname } |
-                    ForEach-Object { @{ Host = $_.Hostname } })
+    $hostEntries = [System.Collections.Generic.List[object]]::new()
+    $seenHosts = @{}
+    foreach ($item in $Collection) {
+        $hostKey = Get-HostLookupKey $item.Hostname
+        if (-not $hostKey -or $seenHosts.ContainsKey($hostKey)) { continue }
+        $seenHosts[$hostKey] = $true
+        $hostEntries.Add([pscustomobject]@{
+            Key = $hostKey
+            Hostname = $item.Hostname
+        }) | Out-Null
+    }
+    if ($hostEntries.Count -eq 0) { return }
+
+    $script:MonitorControl = [hashtable]::Synchronized(@{ Stop = $false })
 
     $rs = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace()
     $rs.Open()
-    $rs.SessionStateProxy.SetVariable('hostList',   $hostList)
+    $rs.SessionStateProxy.SetVariable('hostEntries', $hostEntries.ToArray())
+    $rs.SessionStateProxy.SetVariable('dnsSuffixes', @($script:Config.DnsSuffixes))
+    $rs.SessionStateProxy.SetVariable('checkIntervalSeconds', [Math]::Max(1, [int]$script:Config.CheckIntervalSeconds))
+    $rs.SessionStateProxy.SetVariable('maxConcurrentChecks', [Math]::Max(1, [int]$script:Config.MaxConcurrentChecks))
     $rs.SessionStateProxy.SetVariable('timeoutMs',  $script:Config.PingTimeoutMs)
     $rs.SessionStateProxy.SetVariable('tcpPort',    $script:Config.TcpFallbackPort)
     $rs.SessionStateProxy.SetVariable('tcpTimeoutMs', $script:Config.TcpFallbackTimeoutMs)
-    $rs.SessionStateProxy.SetVariable('resultQueue',$script:PingQueue)
+    $rs.SessionStateProxy.SetVariable('resultQueue', $script:PingQueue)
+    $rs.SessionStateProxy.SetVariable('control', $script:MonitorControl)
 
     $ps = [System.Management.Automation.PowerShell]::Create()
     $ps.Runspace = $rs
     [void]$ps.AddScript({
         Add-Type -AssemblyName System.Net.NetworkInformation -ErrorAction SilentlyContinue
-        $tasks = [System.Collections.Generic.List[object]]::new()
-        foreach ($entry in $hostList) {
-            $ping = [System.Net.NetworkInformation.Ping]::new()
-            try {
-                $tasks.Add([pscustomobject]@{
-                    Task = $ping.SendPingAsync($entry.Host, $timeoutMs)
-                    Ping = $ping
-                    Host = $entry.Host
-                })
-            } catch {
-                $resultQueue.Enqueue(@{
-                    Host    = $entry.Host
-                    Status  = 'offline'
-                    Latency = -1L
-                })
-                $ping.Dispose()
-            }
+        $workerScript = @'
+param(
+    [string]$HostKey,
+    [string]$Hostname,
+    [string[]]$DnsSuffixes,
+    [int]$PingTimeoutMs,
+    [int]$TcpPort,
+    [int]$TcpTimeoutMs,
+    [string]$CachedResolvedHost
+)
+
+Add-Type -AssemblyName System.Net.NetworkInformation -ErrorAction SilentlyContinue
+
+function Get-HostCandidates([string]$BaseHostname, [string[]]$Suffixes) {
+    $candidates = New-Object System.Collections.Generic.List[string]
+    $seen = @{}
+
+    $bareHostname = if ($BaseHostname) { $BaseHostname.Trim() } else { '' }
+    if (-not [string]::IsNullOrWhiteSpace($bareHostname)) {
+        $seen[$bareHostname.ToLowerInvariant()] = $true
+        $candidates.Add($bareHostname) | Out-Null
+    }
+
+    foreach ($suffix in $Suffixes) {
+        if ([string]::IsNullOrWhiteSpace($suffix)) { continue }
+        if ($bareHostname.Contains('.')) { continue }
+        $candidate = "$bareHostname.$($suffix.Trim())"
+        $candidateKey = $candidate.ToLowerInvariant()
+        if (-not $seen.ContainsKey($candidateKey)) {
+            $seen[$candidateKey] = $true
+            $candidates.Add($candidate) | Out-Null
         }
-        $tcpTasks = [System.Collections.Generic.List[object]]::new()
-        foreach ($t in $tasks) {
-            try {
-                $reply = $t.Task.GetAwaiter().GetResult()
-            } catch {
-                $reply = $null
-            }
-            if ($reply -and $reply.Status -eq [System.Net.NetworkInformation.IPStatus]::Success) {
-                $resultQueue.Enqueue(@{
-                    Host    = $t.Host
-                    Status  = 'online'
-                    Latency = [int64]$reply.RoundtripTime
-                })
-            } else {
-                $client = New-Object System.Net.Sockets.TcpClient
-                $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
-                $tcpTasks.Add([pscustomobject]@{
-                    Host      = $t.Host
-                    Client    = $client
-                    Connect   = $client.ConnectAsync($t.Host, $tcpPort)
-                    Stopwatch = $stopwatch
-                })
-            }
-            $t.Ping.Dispose()
-        }
-        foreach ($t in $tcpTasks) {
-            $isOnline = $false
-            $latency = -1L
-            try {
-                if ($t.Connect.Wait($tcpTimeoutMs) -and $t.Client.Connected) {
-                    $isOnline = $true
-                    $latency = [int64][Math]::Max(1, [Math]::Round($t.Stopwatch.Elapsed.TotalMilliseconds))
+    }
+
+    return $candidates.ToArray()
+}
+
+$dnsResolveTimeoutMs = 500
+$resolvedHost = $null
+if (-not [string]::IsNullOrWhiteSpace($CachedResolvedHost)) {
+    $resolvedHost = $CachedResolvedHost.Trim()
+}
+
+if (-not $resolvedHost) {
+    foreach ($candidate in (Get-HostCandidates -BaseHostname $Hostname -Suffixes $DnsSuffixes)) {
+        try {
+            $resolveTask = [System.Net.Dns]::GetHostAddressesAsync($candidate)
+            if ($resolveTask.Wait($dnsResolveTimeoutMs)) {
+                $addresses = $resolveTask.Result
+                if ($addresses -and $addresses.Length -gt 0) {
+                    $resolvedHost = $candidate
+                    break
                 }
-            } catch {}
-            $t.Stopwatch.Stop()
-            try { $t.Client.Close() } catch {}
-            try { $t.Client.Dispose() } catch {}
-            $resultQueue.Enqueue(@{
-                Host    = $t.Host
-                Status  = if ($isOnline) { 'online' } else { 'offline' }
-                Latency = $latency
-            })
+            }
+        } catch {}
+    }
+}
+
+$status = 'offline'
+$latency = -1L
+if ($resolvedHost) {
+    $ping = [System.Net.NetworkInformation.Ping]::new()
+    try {
+        $reply = $ping.SendPingAsync($resolvedHost, $PingTimeoutMs).GetAwaiter().GetResult()
+    } catch {
+        $reply = $null
+    } finally {
+        $ping.Dispose()
+    }
+
+    if ($reply -and $reply.Status -eq [System.Net.NetworkInformation.IPStatus]::Success) {
+        $status = 'online'
+        $latency = [int64]$reply.RoundtripTime
+    } else {
+        $client = New-Object System.Net.Sockets.TcpClient
+        $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+        try {
+            $connectTask = $client.ConnectAsync($resolvedHost, $TcpPort)
+            if ($connectTask.Wait($TcpTimeoutMs) -and $client.Connected) {
+                $status = 'online'
+                $latency = [int64][Math]::Max(1, [Math]::Round($stopwatch.Elapsed.TotalMilliseconds))
+            }
+        } catch {} finally {
+            $stopwatch.Stop()
+            try { $client.Close() } catch {}
+            try { $client.Dispose() } catch {}
+        }
+    }
+}
+
+[pscustomobject]@{
+    HostKey      = $HostKey
+    ResolvedHost = $resolvedHost
+    Status       = $status
+    Latency      = $latency
+    CheckedAt    = [DateTime]::Now
+}
+'@
+
+        $pool = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspacePool(1, $maxConcurrentChecks)
+        $pool.Open()
+        $states = [ordered]@{}
+        $workers = [System.Collections.Generic.List[object]]::new()
+
+        try {
+            foreach ($entry in $hostEntries) {
+                $states[$entry.Key] = [pscustomobject]@{
+                    Key = $entry.Key
+                    Hostname = $entry.Hostname
+                    NextCheckAt = Get-Date
+                    InFlight = $false
+                    CachedResolvedHost = $null
+                }
+            }
+
+            while (-not $control.Stop) {
+                foreach ($worker in @($workers.ToArray())) {
+                    if (-not $worker.Handle.IsCompleted) { continue }
+
+                    $worker.State.InFlight = $false
+                    $worker.State.NextCheckAt = (Get-Date).AddSeconds($checkIntervalSeconds)
+                    try {
+                        $results = @($worker.PowerShell.EndInvoke($worker.Handle))
+                    } catch {
+                        $results = @()
+                    }
+                    try { $worker.PowerShell.Dispose() } catch {}
+                    [void]$workers.Remove($worker)
+
+                    foreach ($result in $results) {
+                        if (-not $result) { continue }
+                        if ($result.ResolvedHost) {
+                            $worker.State.CachedResolvedHost = $result.ResolvedHost
+                        }
+                        $resultQueue.Enqueue(@{
+                            HostKey = $result.HostKey
+                            ResolvedHost = $result.ResolvedHost
+                            Status = $result.Status
+                            Latency = $result.Latency
+                            CheckedAt = $result.CheckedAt
+                        })
+                    }
+                }
+
+                $availableSlots = $maxConcurrentChecks - $workers.Count
+                if ($availableSlots -gt 0) {
+                    $dueStates = @(
+                        $states.Values |
+                            Where-Object { -not $_.InFlight -and $_.NextCheckAt -le (Get-Date) } |
+                            Select-Object -First $availableSlots
+                    )
+
+                    foreach ($state in $dueStates) {
+                        $workerPs = [System.Management.Automation.PowerShell]::Create()
+                        $workerPs.RunspacePool = $pool
+                        [void]$workerPs.AddScript($workerScript).
+                            AddParameter('HostKey', $state.Key).
+                            AddParameter('Hostname', $state.Hostname).
+                            AddParameter('DnsSuffixes', $dnsSuffixes).
+                            AddParameter('PingTimeoutMs', $timeoutMs).
+                            AddParameter('TcpPort', $tcpPort).
+                            AddParameter('TcpTimeoutMs', $tcpTimeoutMs).
+                            AddParameter('CachedResolvedHost', $state.CachedResolvedHost)
+
+                        $state.InFlight = $true
+                        $workers.Add([pscustomobject]@{
+                            State = $state
+                            PowerShell = $workerPs
+                            Handle = $workerPs.BeginInvoke()
+                        }) | Out-Null
+                    }
+                }
+
+                Start-Sleep -Milliseconds 100
+            }
+        } finally {
+            foreach ($worker in @($workers.ToArray())) {
+                try { $worker.PowerShell.Dispose() } catch {}
+            }
+            try { $pool.Close(); $pool.Dispose() } catch {}
         }
     })
 
-    $script:PingPS = $ps
-    $script:PingRunspace = $rs
-    $script:PingAsyncResult = $ps.BeginInvoke()
+    $script:MonitorPS = $ps
+    $script:MonitorRunspace = $rs
+    $script:MonitorAsyncResult = $ps.BeginInvoke()
 }
 
 # =============================== COLUMN MAP ==================================
@@ -369,7 +496,7 @@ $script:ColumnDefs = @(
     @{ Label = 'Greengate';            Index = 23 }
     @{ Label = 'Bemerkung';            Index = 24 }
     @{ Label = 'Hostname';             Index = 25 }
-    @{ Label = 'MAC-Adresse';          Index = $script:MacAddressColumnIndex }
+    @{ Label = 'MAC-Adresse';          Index = 26 }
     @{ Label = 'Serien-Nr. USB';       Index = 27 }
     @{ Label = 'Green Gate korrekt';   Index = 28 }
 )
@@ -676,14 +803,7 @@ $script:ColumnDefs = @(
 
           <Border Grid.Row="1" Padding="18,12,18,18">
             <Grid>
-              <Grid.ColumnDefinitions>
-                <ColumnDefinition Width="Auto"/>
-                <ColumnDefinition Width="10"/>
-                <ColumnDefinition Width="*"/>
-              </Grid.ColumnDefinitions>
-              <Button x:Name="WakeBtn" Grid.Column="0" Style="{StaticResource SecondaryBtn}"
-                      Content="Wake" MinWidth="88" IsEnabled="False"/>
-              <Button x:Name="ConnectBtn" Grid.Column="2" Style="{StaticResource PrimaryBtn}"
+              <Button x:Name="ConnectBtn" Style="{StaticResource PrimaryBtn}"
                       Content="Connect via VNC"
                       HorizontalAlignment="Stretch"
                       IsEnabled="False"/>
@@ -734,7 +854,6 @@ $sortCombo     = $window.FindName('SortCombo')
 $refreshBtn    = $window.FindName('RefreshBtn')
 $serverList    = $window.FindName('ServerList')
 $detailContent = $window.FindName('DetailContent')
-$wakeBtn       = $window.FindName('WakeBtn')
 $connectBtn    = $window.FindName('ConnectBtn')
 $statusBar     = $window.FindName('StatusBar')
 $autoRefLbl    = $window.FindName('AutoRefreshLbl')
@@ -747,6 +866,8 @@ $script:CollView         = [System.Windows.Data.CollectionViewSource]::GetDefaul
 
 # Fast lookup: Hostname -> ServerItem list
 $script:ServerLookup = @{}
+$script:ResolvedHostCache = @{}
+$script:LastStatusUpdate = $null
 
 # Track selected item for detail panel refresh
 $script:SelectedItem        = $null
@@ -772,18 +893,33 @@ function Get-HostLookupKey([string]$Hostname) {
     return $Hostname.Trim().ToLowerInvariant()
 }
 
-function Get-ItemMacAddress($item) {
-    if (-not $item -or -not $item.RawData) { return $null }
-    if (-not $item.RawData.Contains($script:MacAddressColumnIndex)) { return $null }
+function Get-ConnectTarget($item) {
+    if (-not $item -or -not $item.Hostname) { return $null }
+    $hostKey = Get-HostLookupKey $item.Hostname
+    if ($hostKey -and $script:ResolvedHostCache.ContainsKey($hostKey)) {
+        return $script:ResolvedHostCache[$hostKey]
+    }
+    return $item.Hostname
+}
 
-    $value = [string]$item.RawData[$script:MacAddressColumnIndex]
-    if ([string]::IsNullOrWhiteSpace($value)) { return $null }
-    return $value.Trim()
+function Update-LiveMonitorLabel {
+    if (-not $autoRefLbl) { return }
+
+    if ($script:LastStatusUpdate) {
+        $autoRefLbl.Text = "Live monitoring | last update $($script:LastStatusUpdate.ToString('HH:mm:ss'))"
+    } else {
+        $autoRefLbl.Text = 'Live monitoring | waiting for first result'
+    }
+}
+
+function Reset-ResolvedHostCache {
+    $script:ResolvedHostCache.Clear()
+    $script:LastStatusUpdate = $null
+    Update-LiveMonitorLabel
 }
 
 function Update-ActionButtons($item) {
     $connectBtn.IsEnabled = [bool]($item -and $item.Hostname)
-    $wakeBtn.IsEnabled = [bool]($item -and $item.Status -eq 'offline' -and (Get-ItemMacAddress $item))
 }
 
 function Show-StatusMessage([string]$message) {
@@ -791,61 +927,6 @@ function Show-StatusMessage([string]$message) {
     Update-StatusBar
     $script:StatusMessageTimer.Stop()
     $script:StatusMessageTimer.Start()
-}
-
-function ConvertTo-MacBytes([string]$MacAddress) {
-    if ([string]::IsNullOrWhiteSpace($MacAddress)) { return $null }
-
-    $hex = ($MacAddress -replace '[^0-9A-Fa-f]', '').ToUpperInvariant()
-    if ($hex.Length -ne 12) { return $null }
-
-    $bytes = New-Object byte[] 6
-    for ($i = 0; $i -lt 6; $i++) {
-        $bytes[$i] = [Convert]::ToByte($hex.Substring($i * 2, 2), 16)
-    }
-    return $bytes
-}
-
-function Send-WakeOnLan([string]$MacAddress) {
-    $macBytes = ConvertTo-MacBytes $MacAddress
-    if (-not $macBytes) {
-        throw "Invalid MAC address: $MacAddress"
-    }
-
-    $packet = New-Object byte[] 102
-    for ($i = 0; $i -lt 6; $i++) {
-        $packet[$i] = 0xFF
-    }
-    for ($i = 6; $i -lt $packet.Length; $i += 6) {
-        [System.Buffer]::BlockCopy($macBytes, 0, $packet, $i, 6)
-    }
-
-    $client = New-Object System.Net.Sockets.UdpClient
-    try {
-        $client.EnableBroadcast = $true
-        [void]$client.Send($packet, $packet.Length, '255.255.255.255', 9)
-    } finally {
-        try { $client.Close() } catch {}
-        try { $client.Dispose() } catch {}
-    }
-}
-
-function Invoke-WakeServer($item) {
-    if (-not $item) { return }
-
-    $macAddress = Get-ItemMacAddress $item
-    if (-not $macAddress) {
-        Show-StatusMessage "Wake-on-LAN unavailable: no MAC address configured."
-        return
-    }
-
-    try {
-        Send-WakeOnLan $macAddress
-        $targetName = if ($item.Hostname) { $item.Hostname } else { $item.DisplayName }
-        Show-StatusMessage "WOL packet sent to $targetName."
-    } catch {
-        Show-StatusMessage "Wake-on-LAN failed: $($_.Exception.Message)"
-    }
 }
 
 # ============================ DETAIL PANEL ===================================
@@ -1025,9 +1106,12 @@ function Load-Servers {
     $statusBar.Text = "Reading Excel file..."
     $excelPath = Resolve-ExcelFilePath
     $items = Read-ExcelServers -Path $excelPath
+    $selectedHostKey = $null
+    if ($script:SelectedItem) {
+        $selectedHostKey = Get-HostLookupKey $script:SelectedItem.Hostname
+    }
     $script:ServerCollection.Clear()
     $script:ServerLookup.Clear()
-    $prevSelected = $null
     foreach ($item in $items) {
         $script:ServerCollection.Add($item) | Out-Null
         $key = Get-HostLookupKey $item.Hostname
@@ -1040,6 +1124,14 @@ function Load-Servers {
     }
     Apply-Sort
     Apply-Filter
+    $selectedItem = $null
+    if ($selectedHostKey -and $script:ServerLookup.ContainsKey($selectedHostKey)) {
+        $selectedItem = $script:ServerLookup[$selectedHostKey][0]
+        $serverList.SelectedItem = $selectedItem
+    } else {
+        $serverList.SelectedItem = $null
+    }
+    Update-DetailPanel $selectedItem
     Update-StatusBar
     $subTitle.Text = "$($script:ServerCollection.Count) servers loaded"
     return $items
@@ -1049,11 +1141,14 @@ function Refresh-All {
     $refreshBtn.IsEnabled = $false
     $refreshBtn.Content   = "Refreshing..."
     try {
+        Stop-LiveMonitor
+        Reset-ResolvedHostCache
         $items = Load-Servers
         if ($items.Count -gt 0) {
-            Start-PingAll -Collection $script:ServerCollection
+            Start-LiveMonitor -Collection $script:ServerCollection
         } else {
             $statusBar.Text = "No servers loaded. Check Excel file path."
+            $autoRefLbl.Text = 'Live monitoring | no servers loaded'
         }
     } finally {
         $refreshBtn.IsEnabled = $true
@@ -1077,7 +1172,8 @@ function Connect-VNC {
         return
     }
     $pw   = $script:Config.VncPassword
-    $host = $item.Hostname
+    $host = Get-ConnectTarget $item
+    if (-not $host) { $host = $item.Hostname }
     Start-Process -FilePath $script:Config.VncExe -ArgumentList "-password `"$pw`" -connect $host"
 }
 
@@ -1111,11 +1207,6 @@ $connectBtn.Add_Click({
     Connect-VNC ($serverList.SelectedItem -as [ServerItem])
 })
 
-# Wake button
-$wakeBtn.Add_Click({
-    Invoke-WakeServer ($serverList.SelectedItem -as [ServerItem])
-})
-
 # Credit button -> open default mail client
 $creditBtn.Add_Click({
     Start-Process "mailto:ithelp@ford.com"
@@ -1130,11 +1221,15 @@ $pingTimer.Add_Tick({
     $result = $null
     $updated = $false
     while ($script:PingQueue -and $script:PingQueue.TryDequeue([ref]$result)) {
-        $matchedItems = $script:ServerLookup[(Get-HostLookupKey $result.Host)]
+        if ($result.ResolvedHost) {
+            $script:ResolvedHostCache[$result.HostKey] = $result.ResolvedHost
+        }
+        $matchedItems = $script:ServerLookup[$result.HostKey]
         if ($matchedItems) {
             foreach ($item in $matchedItems) {
                 $item.Status    = $result.Status
                 $item.LatencyMs = $result.Latency
+                $item.ResolvedHost = $result.ResolvedHost
                 $updated = $true
                 # Refresh detail panel status if this is the selected server
                 if ($script:SelectedItem -eq $item) {
@@ -1142,29 +1237,13 @@ $pingTimer.Add_Tick({
                 }
             }
         }
+        $script:LastStatusUpdate = $result.CheckedAt
     }
     if ($updated) { Update-StatusBar }
+    if ($result) { Update-LiveMonitorLabel }
 })
 $pingTimer.Start()
-
-# Auto-refresh countdown
-$script:AutoRefCountdown = $script:Config.AutoRefreshSeconds
-$autoRefTimer = New-Object System.Windows.Threading.DispatcherTimer
-if ($script:Config.AutoRefreshSeconds -gt 0) {
-    $autoRefTimer.Interval = [TimeSpan]::FromSeconds(1)
-    $autoRefTimer.Add_Tick({
-        $script:AutoRefCountdown--
-        if ($script:AutoRefCountdown -le 0) {
-            $script:AutoRefCountdown = $script:Config.AutoRefreshSeconds
-            Refresh-All
-        }
-        $autoRefLbl.Text = "Auto-refresh in $script:AutoRefCountdown s"
-    })
-    $autoRefTimer.Start()
-    $autoRefLbl.Text = "Auto-refresh in $script:AutoRefCountdown s"
-} else {
-    $autoRefLbl.Text = "Auto-refresh: off"
-}
+Update-LiveMonitorLabel
 
 # ================= FILE WATCHER (auto-reload when Excel changes) ==============
 $script:WatcherRegistered = $false
@@ -1183,9 +1262,8 @@ function Register-FileWatcher {
         -EventName Changed -SourceIdentifier 'SPC_ExcelChanged' -Action {
         Start-Sleep -Seconds 2   # wait for Excel to finish writing
         $window.Dispatcher.Invoke([action]{
-            $statusBar.Text = "Excel file changed - reloading..."
-            $items = Load-Servers
-            if ($items.Count -gt 0) { Start-PingAll -Collection $script:ServerCollection }
+            Show-StatusMessage "Excel file changed - reloading..."
+            Refresh-All
         })
     }
     $script:WatcherRegistered = $true
@@ -1199,17 +1277,11 @@ $window.Add_Loaded({
 
 $window.Add_Closed({
     $pingTimer.Stop()
-    $autoRefTimer.Stop()
     if ($script:WatcherRegistered) {
         Unregister-Event -SourceIdentifier 'SPC_ExcelChanged' -ErrorAction SilentlyContinue
         $script:Watcher.Dispose()
     }
-    if ($script:PingRunspace) {
-        try { $script:PingRunspace.Close(); $script:PingRunspace.Dispose() } catch {}
-    }
-    if ($script:PingPS) {
-        try { $script:PingPS.Dispose() } catch {}
-    }
+    Stop-LiveMonitor
 })
 
 # ================================= SHOW ======================================
