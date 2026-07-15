@@ -1,7 +1,7 @@
 # SPC Server Dashboard
 
 A standalone, zero-dependency Windows dashboard for monitoring SPC measurement-station servers.  
-Double-click a server to connect via UltraVNC.  No Python, Node.js, or additional software required — just PowerShell 5.1+ (built-in since Windows 10).
+The dashboard continuously re-checks server status in the background and uses DNS suffix fallback so bare SPC hostnames still resolve across both Ford network domains. Double-click a server to connect via UltraVNC. No Python, Node.js, or additional software required — just PowerShell 5.1+ (built-in since Windows 10).
 
 ---
 
@@ -45,14 +45,26 @@ $script:Config = @{
     # Full path to the UltraVNC viewer executable
     VncExe             = "C:\Legacy\UltraVNC\UltraVNC-Viewer.exe"
 
-    # VNC password — set here OR via the VNC_PASSWORD environment variable
+    # VNC password - set here OR via the VNC_PASSWORD environment variable
     VncPassword        = "CHANGE_ME"    # <-- replace with real password
 
-    # How often to automatically re-ping all servers (seconds). 0 = disabled.
-    AutoRefreshSeconds = 30
+    # DNS suffixes tried when a bare hostname does not resolve
+    DnsSuffixes        = @('', 'niehlt.gft.ford.com', 'niehl.ford.com')
+
+    # Target cadence for re-checking each host
+    CheckIntervalSeconds = 5
+
+    # Maximum number of parallel host checks
+    MaxConcurrentChecks = 25
 
     # Ping timeout per host (milliseconds)
     PingTimeoutMs      = 1500
+
+    # Fallback VNC port check when ICMP is blocked
+    TcpFallbackPort    = 5900
+
+    # Fallback TCP timeout in milliseconds
+    TcpFallbackTimeoutMs = 500
 }
 ```
 
@@ -77,10 +89,10 @@ The script reads `$env:VNC_PASSWORD` at startup and prefers it over the hardcode
 | **Filter** | Type in the Search box — filters by SPC name or hostname in real time |
 | **Sort** | Use the Sort drop-down in the header (Name / Status / Latency) |
 | **See details** | Click any server — all Excel columns appear in the right-hand panel |
-| **Connect via VNC** | Double-click any server **or** select it and click **Connect via VNC** |
+| **Connect via VNC** | Double-click any server **or** select it and click **Connect via VNC**. The dashboard reuses the last resolved FQDN so VNC connects work even when the Excel sheet stores a bare hostname |
 | **Manual refresh** | Click **↺ Refresh** in the header |
-| **Auto-refresh** | Pings all servers every 30 s (configurable); countdown shown in footer |
-| **Excel hot-reload** | When the `.xlsm` file is saved/updated, the list reloads automatically |
+| **Live monitoring** | A background runspace continuously re-checks hosts in parallel batches; the footer shows `Live monitoring` with the last status update time |
+| **Excel hot-reload** | When the `.xlsm` file is saved/updated, the list reloads automatically and the live monitor restarts with a fresh DNS cache |
 
 ### Status indicators
 
@@ -126,7 +138,6 @@ The script reads `$env:VNC_PASSWORD` at startup and prefers it over the hardcode
 | X | 23 | Greengate | Detail panel |
 | Y | 24 | Bemerkung | Detail panel |
 | **Z** | **25** | **Hostname** | **VNC connect target** (e.g. `SPC48478`) |
-| AA | 26 | MAC-Adresse | Detail panel |
 | AB | 27 | Serien-Nr. USB | Detail panel |
 | AC | 28 | Green Gate korrekt | Detail panel |
 
@@ -146,7 +157,8 @@ Save the file. If the dashboard is already open, it reloads automatically within
 |---|---|
 | "Excel file not found" error | Ensure the `.xlsm` file is in the same folder as `SPC-Dashboard.ps1`, or update `ExcelFile` in the config |
 | "VNC Not Found" dialog | Update `VncExe` in the config to the correct path |
-| All servers show offline | Check network connectivity; adjust `PingTimeoutMs` if the network is slow |
+| Most servers show offline | Verify `DnsSuffixes` includes the correct Ford domains for your site and keep `TcpFallbackPort` set to the VNC port when ICMP is blocked |
+| Status updates feel slow | Increase `MaxConcurrentChecks` or lower `CheckIntervalSeconds` carefully; the defaults are tuned for about 160 SPC hosts |
 | Script won't run | Right-click `Start-Dashboard.bat` → *Run as administrator* |
 | Script blocked by policy | The `.bat` launcher already passes `-ExecutionPolicy Bypass`; if blocked further, check Group Policy |
 
