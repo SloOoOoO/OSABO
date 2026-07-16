@@ -605,6 +605,35 @@ $script:ColumnDefs = @(
       </Setter>
     </Style>
 
+    <!-- VNC PasswordBox -->
+    <Style x:Key="PwdStyle" TargetType="PasswordBox">
+      <Setter Property="FontSize"          Value="13"/>
+      <Setter Property="Foreground"        Value="#1C1C1E"/>
+      <Setter Property="Background"        Value="#FFFFFF"/>
+      <Setter Property="BorderBrush"       Value="#D1D1D6"/>
+      <Setter Property="BorderThickness"   Value="1"/>
+      <Setter Property="Padding"           Value="10,7"/>
+      <Setter Property="VerticalContentAlignment" Value="Center"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="PasswordBox">
+            <Border x:Name="Bd" CornerRadius="8"
+                    Background="{TemplateBinding Background}"
+                    BorderBrush="{TemplateBinding BorderBrush}"
+                    BorderThickness="{TemplateBinding BorderThickness}">
+              <ScrollViewer x:Name="PART_ContentHost" Margin="{TemplateBinding Padding}"/>
+            </Border>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsFocused" Value="True">
+                <Setter TargetName="Bd" Property="BorderBrush" Value="#007AFF"/>
+                <Setter TargetName="Bd" Property="BorderThickness" Value="1.5"/>
+              </Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+
     <!-- ListView item container -->
     <Style x:Key="ListItem" TargetType="ListViewItem">
       <Setter Property="HorizontalContentAlignment" Value="Stretch"/>
@@ -706,6 +735,7 @@ $script:ColumnDefs = @(
           <ColumnDefinition Width="Auto"/>
           <ColumnDefinition Width="Auto"/>
           <ColumnDefinition Width="Auto"/>
+          <ColumnDefinition Width="Auto"/>
         </Grid.ColumnDefinitions>
 
         <!-- App title -->
@@ -742,8 +772,16 @@ $script:ColumnDefs = @(
           <ComboBoxItem Content="Sort: Latency" Tag="Latency"/>
         </ComboBox>
 
+        <!-- VNC Password -->
+        <Grid Grid.Column="5" VerticalAlignment="Center" Margin="0,0,10,0" Width="150">
+          <PasswordBox x:Name="VncPasswordBox" Style="{StaticResource PwdStyle}"/>
+          <TextBlock x:Name="VncPasswordHint" Text="VNC password"
+                     IsHitTestVisible="False" VerticalAlignment="Center"
+                     Margin="12,0" Foreground="#AEAEB2" FontSize="12"/>
+        </Grid>
+
         <!-- Refresh -->
-        <Button x:Name="RefreshBtn" Grid.Column="5" Style="{StaticResource SecondaryBtn}"
+        <Button x:Name="RefreshBtn" Grid.Column="6" Style="{StaticResource SecondaryBtn}"
                 Content="Refresh" VerticalAlignment="Center"/>
       </Grid>
     </Border>
@@ -905,6 +943,8 @@ $creditBtn       = $window.FindName('CreditBtn')
 $filterAllBtn    = $window.FindName('FilterAllBtn')
 $filterOnlineBtn = $window.FindName('FilterOnlineBtn')
 $filterOfflineBtn= $window.FindName('FilterOfflineBtn')
+$vncPasswordBox  = $window.FindName('VncPasswordBox')
+$vncPasswordHint = $window.FindName('VncPasswordHint')
 
 # Context menu on server list (created in code to avoid NameScope limitations)
 $ctxMenu = New-Object System.Windows.Controls.ContextMenu
@@ -938,6 +978,46 @@ $script:StatusMessageTimer.Add_Tick({
     $script:StatusMessage = $null
     Update-StatusBar
 })
+
+# ====================== SETTINGS (password persistence) ======================
+$script:SettingsDir  = Join-Path $env:APPDATA 'SPC-Dashboard'
+$script:SettingsFile = Join-Path $script:SettingsDir 'settings.json'
+
+function Load-Settings {
+    $pw = ''
+    if (Test-Path $script:SettingsFile) {
+        try {
+            $s = Get-Content $script:SettingsFile -Raw -Encoding ASCII | ConvertFrom-Json
+            if ($s.VncPasswordEncrypted) {
+                $ss   = ConvertTo-SecureString $s.VncPasswordEncrypted -ErrorAction Stop
+                $bstr = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($ss)
+                $pw   = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto($bstr)
+                [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
+            }
+        } catch { $pw = '' }
+    }
+    if (-not $pw) {
+        if ($env:VNC_PASSWORD) {
+            $pw = $env:VNC_PASSWORD
+        } elseif ($script:Config.VncPassword -and $script:Config.VncPassword -ne 'CHANGE_ME') {
+            $pw = $script:Config.VncPassword
+        }
+    }
+    return $pw
+}
+
+function Save-Settings([string]$plainPassword) {
+    try {
+        if (-not (Test-Path $script:SettingsDir)) {
+            New-Item -ItemType Directory -Path $script:SettingsDir -Force | Out-Null
+        }
+        $ss        = ConvertTo-SecureString $plainPassword -AsPlainText -Force
+        $encrypted = ConvertFrom-SecureString $ss
+        @{ VncPasswordEncrypted = $encrypted } |
+            ConvertTo-Json |
+            Set-Content -Path $script:SettingsFile -Encoding ASCII
+    } catch {}
+}
 
 # =================== HELPER: colour string -> Brush ===========================
 function New-Brush([string]$hex) {
@@ -1328,7 +1408,12 @@ function Connect-VNC {
             "VNC Not Found", "OK", "Warning") | Out-Null
         return
     }
-    $pw          = $script:Config.VncPassword
+    $pw = $vncPasswordBox.Password
+    if ([string]::IsNullOrEmpty($pw)) {
+        $vncPasswordBox.Focus() | Out-Null
+        Show-StatusMessage "Enter VNC password before connecting"
+        return
+    }
     $connectHost = Get-ConnectTarget $item
     if (-not $connectHost) { $connectHost = $item.Hostname }
 
@@ -1352,7 +1437,12 @@ function Connect-VNC {
             } catch {}
         }
     }
-    Start-Process -FilePath $vncExe -ArgumentList "-password `"$pw`" -connect $connectHost"
+    # UltraVNC 1.6.x: -password must come BEFORE -connect (triggers immediate connection)
+    # Pass as array so that passwords with special chars are quoted correctly
+    $escapedPw = $pw -replace '"', '\"'
+    $argList   = @('-password', ('"' + $escapedPw + '"'), '-connect', ($connectHost + '::5900'))
+    Start-Process -FilePath $vncExe -ArgumentList $argList
+    Show-StatusMessage "Connecting to $connectHost..."
 }
 
 # ============================== EVENT HANDLERS ===============================
@@ -1373,6 +1463,16 @@ $refreshBtn.Add_Click({ Refresh-All })
 $filterAllBtn.Add_Click({     Set-FilterSegment 'All'     })
 $filterOnlineBtn.Add_Click({  Set-FilterSegment 'Online'  })
 $filterOfflineBtn.Add_Click({ Set-FilterSegment 'Offline' })
+
+# VNC password box: toggle hint visibility and auto-save on change
+$vncPasswordBox.Add_PasswordChanged({
+    if ($vncPasswordBox.Password.Length -gt 0) {
+        $vncPasswordHint.Visibility = 'Collapsed'
+    } else {
+        $vncPasswordHint.Visibility = 'Visible'
+    }
+    Save-Settings $vncPasswordBox.Password
+})
 
 # Context menu: Copy hostname
 $copyHostMenuItem.Add_Click({
@@ -1485,6 +1585,12 @@ $window.Add_Loaded({
         $autoRefLbl.ToolTip = "VNC: $($script:VncExeResolved)"
     } else {
         $autoRefLbl.ToolTip = "VNC viewer not found - update VncExe in config"
+    }
+    # Load saved VNC password (settings file > env var > config)
+    $savedPw = Load-Settings
+    if ($savedPw) {
+        $vncPasswordBox.Password    = $savedPw
+        $vncPasswordHint.Visibility = 'Collapsed'
     }
     # Initialize filter segments (All active by default)
     Set-FilterSegment 'All'
