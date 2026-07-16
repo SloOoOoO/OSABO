@@ -29,8 +29,9 @@ $script:Config = @{
     MaxConcurrentChecks = 50
     # Per-host ping timeout in milliseconds (2000 = safer for corporate firewalls)
     PingTimeoutMs      = 2000
-    # Candidate VNC listener ports checked in order; the first responsive one is used for Connect
-    VncPorts           = @(5900, 9506)
+    # Candidate VNC listener ports checked in order; Ford SPC uses 9506 by default.
+    # Re-add 5900 here later if a site still needs it.
+    VncPorts           = @(9506)
     # Remote Desktop fallback port; if this alone answers, Connect launches mstsc instead of UltraVNC
     RdpPort            = 3389
     # Per-port TCP timeout in milliseconds (1500 = more lenient for slow networks)
@@ -1193,7 +1194,7 @@ function Get-VncPorts {
         }
     }
     if ($ports.Count -eq 0) {
-        $ports.Add(5900) | Out-Null
+        $ports.Add(9506) | Out-Null
     }
     return $ports.ToArray()
 }
