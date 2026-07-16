@@ -29,9 +29,11 @@ $script:Config = @{
     MaxConcurrentChecks = 50
     # Per-host ping timeout in milliseconds (2000 = safer for corporate firewalls)
     PingTimeoutMs      = 2000
-    # Fallback VNC port check when ICMP is blocked
-    TcpFallbackPort    = 5900
-    # Fallback TCP timeout in milliseconds (1500 = more lenient for slow networks)
+    # Candidate VNC listener ports checked in order; the first responsive one is used for Connect
+    VncPorts           = @(5900, 9506)
+    # Remote Desktop fallback port; if this alone answers, Connect launches mstsc instead of UltraVNC
+    RdpPort            = 3389
+    # Per-port TCP timeout in milliseconds (1500 = more lenient for slow networks)
     TcpFallbackTimeoutMs = 1500
 }
 # ============================================================================
@@ -56,6 +58,8 @@ public class ServerItem : INotifyPropertyChanged {
     public string    Hostname        { get; set; }
     public string    ResolvedHost    { get; set; }
     public string    DetectionMethod { get; set; }
+    public int       DetectedPort    { get; set; }
+    public string    ConnectionMode  { get; set; }
     public int       RowNumber       { get; set; }
     public Hashtable RawData         { get; set; }
 
@@ -245,6 +249,10 @@ function Start-LiveMonitor {
     foreach ($item in $Collection) {
         $item.Status = 'checking'
         $item.LatencyMs = -1L
+        $item.ResolvedHost = $null
+        $item.DetectionMethod = $null
+        $item.DetectedPort = 0
+        $item.ConnectionMode = $null
     }
 
     $script:PingQueue = [System.Collections.Concurrent.ConcurrentQueue[hashtable]]::new()
@@ -273,7 +281,8 @@ function Start-LiveMonitor {
     $rs.SessionStateProxy.SetVariable('checkIntervalSeconds', [Math]::Max(1, [int]$script:Config.CheckIntervalSeconds))
     $rs.SessionStateProxy.SetVariable('maxConcurrentChecks', [Math]::Max(1, [int]$script:Config.MaxConcurrentChecks))
     $rs.SessionStateProxy.SetVariable('timeoutMs',  $script:Config.PingTimeoutMs)
-    $rs.SessionStateProxy.SetVariable('tcpPort',    $script:Config.TcpFallbackPort)
+    $rs.SessionStateProxy.SetVariable('vncPorts',   @(Get-VncPorts))
+    $rs.SessionStateProxy.SetVariable('rdpPort',    (Get-RdpPort))
     $rs.SessionStateProxy.SetVariable('tcpTimeoutMs', $script:Config.TcpFallbackTimeoutMs)
     $rs.SessionStateProxy.SetVariable('resultQueue', $script:PingQueue)
     $rs.SessionStateProxy.SetVariable('control', $script:MonitorControl)
@@ -288,7 +297,8 @@ param(
     [string]$Hostname,
     [string[]]$DnsSuffixes,
     [int]$PingTimeoutMs,
-    [int]$TcpPort,
+    [int[]]$VncPorts,
+    [int]$RdpPort,
     [int]$TcpTimeoutMs,
     [string]$CachedResolvedHost
 )
@@ -319,6 +329,52 @@ function Get-HostCandidates([string]$BaseHostname, [string[]]$Suffixes) {
     return $candidates.ToArray()
 }
 
+function Get-TcpCandidatePorts([int[]]$Ports, [int]$FallbackRdpPort) {
+    $candidates = New-Object System.Collections.Generic.List[int]
+    $seen = @{}
+
+    foreach ($portValue in $Ports) {
+        $port = 0
+        try { $port = [int]$portValue } catch { $port = 0 }
+        if ($port -le 0) { continue }
+        $key = [string]$port
+        if (-not $seen.ContainsKey($key)) {
+            $seen[$key] = $true
+            $candidates.Add($port) | Out-Null
+        }
+    }
+
+    if ($FallbackRdpPort -gt 0) {
+        $rdpKey = [string]$FallbackRdpPort
+        if (-not $seen.ContainsKey($rdpKey)) {
+            $seen[$rdpKey] = $true
+            $candidates.Add($FallbackRdpPort) | Out-Null
+        }
+    }
+
+    return $candidates.ToArray()
+}
+
+function Test-TcpPort([string]$TargetHost, [int]$Port, [int]$TimeoutMs) {
+    $client = New-Object System.Net.Sockets.TcpClient
+    $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+    try {
+        $connectTask = $client.ConnectAsync($TargetHost, $Port)
+        if ($connectTask.Wait($TimeoutMs) -and $client.Connected) {
+            return [pscustomobject]@{
+                Port    = $Port
+                Latency = [int64][Math]::Max(1, [Math]::Round($stopwatch.Elapsed.TotalMilliseconds))
+            }
+        }
+    } catch {} finally {
+        $stopwatch.Stop()
+        try { $client.Close() } catch {}
+        try { $client.Dispose() } catch {}
+    }
+
+    return $null
+}
+
 $dnsResolveTimeoutMs = 500
 $resolvedHost = $null
 if (-not [string]::IsNullOrWhiteSpace($CachedResolvedHost)) {
@@ -343,8 +399,11 @@ if (-not $resolvedHost) {
 $status = 'offline'
 $latency = -1L
 $detectionMethod = ''
+$detectedPort = 0
+$connectionMode = ''
 if ($resolvedHost) {
     $ping = [System.Net.NetworkInformation.Ping]::new()
+    $pingSucceeded = $false
     try {
         $reply = $ping.SendPingAsync($resolvedHost, $PingTimeoutMs).GetAwaiter().GetResult()
     } catch {
@@ -354,24 +413,31 @@ if ($resolvedHost) {
     }
 
     if ($reply -and $reply.Status -eq [System.Net.NetworkInformation.IPStatus]::Success) {
-        $status = 'online'
+        $pingSucceeded = $true
         $latency = [int64]$reply.RoundtripTime
-        $detectionMethod = 'ICMP'
-    } else {
-        $client = New-Object System.Net.Sockets.TcpClient
-        $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
-        try {
-            $connectTask = $client.ConnectAsync($resolvedHost, $TcpPort)
-            if ($connectTask.Wait($TcpTimeoutMs) -and $client.Connected) {
-                $status = 'online'
-                $latency = [int64][Math]::Max(1, [Math]::Round($stopwatch.Elapsed.TotalMilliseconds))
-                $detectionMethod = "TCP:$TcpPort"
+    }
+
+    foreach ($candidatePort in (Get-TcpCandidatePorts -Ports $VncPorts -FallbackRdpPort $RdpPort)) {
+        $probeResult = Test-TcpPort -TargetHost $resolvedHost -Port $candidatePort -TimeoutMs $TcpTimeoutMs
+        if ($probeResult) {
+            $status = 'online'
+            $latency = $probeResult.Latency
+            $detectedPort = $probeResult.Port
+            if ($RdpPort -gt 0 -and $detectedPort -eq $RdpPort) {
+                $connectionMode = 'RDP'
+                $detectionMethod = "TCP:$detectedPort RDP"
+            } else {
+                $connectionMode = 'VNC'
+                $detectionMethod = "TCP:$detectedPort"
             }
-        } catch {} finally {
-            $stopwatch.Stop()
-            try { $client.Close() } catch {}
-            try { $client.Dispose() } catch {}
+            break
         }
+    }
+
+    if ($status -ne 'online' -and $pingSucceeded) {
+        $status = 'online'
+        $detectionMethod = 'ICMP'
+        $connectionMode = 'VNC'
     }
 }
 
@@ -381,6 +447,8 @@ if ($resolvedHost) {
     Status          = $status
     Latency         = $latency
     DetectionMethod = $detectionMethod
+    DetectedPort    = $detectedPort
+    ConnectionMode  = $connectionMode
     CheckedAt       = [DateTime]::Now
 }
 '@
@@ -426,6 +494,8 @@ if ($resolvedHost) {
                             Status          = $result.Status
                             Latency         = $result.Latency
                             DetectionMethod = $result.DetectionMethod
+                            DetectedPort    = $result.DetectedPort
+                            ConnectionMode  = $result.ConnectionMode
                             CheckedAt       = $result.CheckedAt
                         })
                     }
@@ -447,7 +517,8 @@ if ($resolvedHost) {
                             AddParameter('Hostname', $state.Hostname).
                             AddParameter('DnsSuffixes', $dnsSuffixes).
                             AddParameter('PingTimeoutMs', $timeoutMs).
-                            AddParameter('TcpPort', $tcpPort).
+                            AddParameter('VncPorts', $vncPorts).
+                            AddParameter('RdpPort', $rdpPort).
                             AddParameter('TcpTimeoutMs', $tcpTimeoutMs).
                             AddParameter('CachedResolvedHost', $state.CachedResolvedHost)
 
@@ -634,6 +705,66 @@ $script:ColumnDefs = @(
       </Setter>
     </Style>
 
+    <!-- Plain-text reveal TextBox -->
+    <Style x:Key="PwdRevealTextStyle" TargetType="TextBox">
+      <Setter Property="FontSize"          Value="13"/>
+      <Setter Property="Foreground"        Value="#1C1C1E"/>
+      <Setter Property="Background"        Value="#FFFFFF"/>
+      <Setter Property="BorderBrush"       Value="#D1D1D6"/>
+      <Setter Property="BorderThickness"   Value="1"/>
+      <Setter Property="Padding"           Value="10,7"/>
+      <Setter Property="VerticalContentAlignment" Value="Center"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="TextBox">
+            <Border x:Name="Bd" CornerRadius="8"
+                    Background="{TemplateBinding Background}"
+                    BorderBrush="{TemplateBinding BorderBrush}"
+                    BorderThickness="{TemplateBinding BorderThickness}">
+              <ScrollViewer x:Name="PART_ContentHost" Margin="{TemplateBinding Padding}"/>
+            </Border>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsFocused" Value="True">
+                <Setter TargetName="Bd" Property="BorderBrush" Value="#007AFF"/>
+                <Setter TargetName="Bd" Property="BorderThickness" Value="1.5"/>
+              </Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+
+    <!-- Password reveal button -->
+    <Style x:Key="EyeBtn" TargetType="Button">
+      <Setter Property="Width"             Value="28"/>
+      <Setter Property="Height"            Value="28"/>
+      <Setter Property="Background"        Value="#F2F2F7"/>
+      <Setter Property="BorderBrush"       Value="#D1D1D6"/>
+      <Setter Property="BorderThickness"   Value="1"/>
+      <Setter Property="Cursor"            Value="Hand"/>
+      <Setter Property="Padding"           Value="6"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="Button">
+            <Border x:Name="Bd" CornerRadius="8"
+                    Background="{TemplateBinding Background}"
+                    BorderBrush="{TemplateBinding BorderBrush}"
+                    BorderThickness="{TemplateBinding BorderThickness}">
+              <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+            </Border>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsMouseOver" Value="True">
+                <Setter TargetName="Bd" Property="Background" Value="#E5E5EA"/>
+              </Trigger>
+              <Trigger Property="IsPressed" Value="True">
+                <Setter TargetName="Bd" Property="Background" Value="#D1D1D6"/>
+              </Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+
     <!-- ListView item container -->
     <Style x:Key="ListItem" TargetType="ListViewItem">
       <Setter Property="HorizontalContentAlignment" Value="Stretch"/>
@@ -773,11 +904,30 @@ $script:ColumnDefs = @(
         </ComboBox>
 
         <!-- VNC Password -->
-        <Grid Grid.Column="5" VerticalAlignment="Center" Margin="0,0,10,0" Width="150">
-          <PasswordBox x:Name="VncPasswordBox" Style="{StaticResource PwdStyle}"/>
-          <TextBlock x:Name="VncPasswordHint" Text="VNC password"
-                     IsHitTestVisible="False" VerticalAlignment="Center"
-                     Margin="12,0" Foreground="#AEAEB2" FontSize="12"/>
+        <Grid Grid.Column="5" VerticalAlignment="Center" Margin="0,0,10,0" Width="184">
+          <Grid.ColumnDefinitions>
+            <ColumnDefinition Width="*"/>
+            <ColumnDefinition Width="34"/>
+          </Grid.ColumnDefinitions>
+          <Grid Grid.Column="0">
+            <PasswordBox x:Name="VncPasswordBox" Style="{StaticResource PwdStyle}"/>
+            <TextBox x:Name="VncPasswordTextBox" Style="{StaticResource PwdRevealTextStyle}"
+                     Visibility="Collapsed"/>
+            <TextBlock x:Name="VncPasswordHint" Text="VNC password"
+                       IsHitTestVisible="False" VerticalAlignment="Center"
+                       Margin="12,0" Foreground="#AEAEB2" FontSize="12"/>
+          </Grid>
+          <Button x:Name="VncPasswordRevealBtn" Grid.Column="1" Margin="6,0,0,0"
+                  Style="{StaticResource EyeBtn}">
+            <Viewbox Width="14" Height="10">
+              <Grid>
+                <Path Data="M 1 5 C 3 1, 11 1, 13 5 C 11 9, 3 9, 1 5 Z"
+                      Stroke="#6E6E73" StrokeThickness="1.2" Stretch="Fill"/>
+                <Ellipse Width="3.4" Height="3.4" Stroke="#6E6E73"
+                         StrokeThickness="1.2" Fill="Transparent"/>
+              </Grid>
+            </Viewbox>
+          </Button>
         </Grid>
 
         <!-- Refresh -->
@@ -944,7 +1094,9 @@ $filterAllBtn    = $window.FindName('FilterAllBtn')
 $filterOnlineBtn = $window.FindName('FilterOnlineBtn')
 $filterOfflineBtn= $window.FindName('FilterOfflineBtn')
 $vncPasswordBox  = $window.FindName('VncPasswordBox')
+$vncPasswordTextBox = $window.FindName('VncPasswordTextBox')
 $vncPasswordHint = $window.FindName('VncPasswordHint')
+$vncPasswordRevealBtn = $window.FindName('VncPasswordRevealBtn')
 
 # Context menu on server list (created in code to avoid NameScope limitations)
 $ctxMenu = New-Object System.Windows.Controls.ContextMenu
@@ -964,6 +1116,7 @@ $script:ResolvedHostCache  = @{}
 $script:LastStatusUpdate   = $null
 $script:StatusFilter       = 'All'
 $script:VncExeResolved     = $null
+$script:PasswordSyncInProgress = $false
 
 # Track selected item for detail panel refresh
 $script:SelectedItem        = $null
@@ -1030,13 +1183,68 @@ function Get-HostLookupKey([string]$Hostname) {
     return $Hostname.Trim().ToLowerInvariant()
 }
 
+function Get-VncPorts {
+    $ports = New-Object System.Collections.Generic.List[int]
+    foreach ($candidate in @($script:Config.VncPorts)) {
+        $port = 0
+        try { $port = [int]$candidate } catch { $port = 0 }
+        if ($port -gt 0 -and -not $ports.Contains($port)) {
+            $ports.Add($port) | Out-Null
+        }
+    }
+    if ($ports.Count -eq 0) {
+        $ports.Add(5900) | Out-Null
+    }
+    return $ports.ToArray()
+}
+
+function Get-RdpPort {
+    $port = 3389
+    try {
+        $configuredPort = [int]$script:Config.RdpPort
+        if ($configuredPort -gt 0) {
+            $port = $configuredPort
+        }
+    } catch {}
+    return $port
+}
+
 function Get-ConnectTarget($item) {
     if (-not $item -or -not $item.Hostname) { return $null }
     $hostKey = Get-HostLookupKey $item.Hostname
+    if ($item.ResolvedHost) {
+        return $item.ResolvedHost
+    }
     if ($hostKey -and $script:ResolvedHostCache.ContainsKey($hostKey)) {
         return $script:ResolvedHostCache[$hostKey]
     }
     return $item.Hostname
+}
+
+function Get-ConnectSpec($item) {
+    $port = 0
+    $mode = 'VNC'
+
+    if ($item) {
+        try { $port = [int]$item.DetectedPort } catch { $port = 0 }
+        if ($item.ConnectionMode) {
+            $mode = $item.ConnectionMode
+        }
+    }
+
+    if ($port -le 0) {
+        $vncPorts = @(Get-VncPorts)
+        if ($vncPorts.Count -gt 0) {
+            $port = [int]$vncPorts[0]
+        }
+        $mode = 'VNC'
+    }
+
+    return [pscustomobject]@{
+        Host = Get-ConnectTarget $item
+        Port = $port
+        Mode = $mode
+    }
 }
 
 function Update-LiveMonitorLabel {
@@ -1057,6 +1265,17 @@ function Reset-ResolvedHostCache {
 
 function Update-ActionButtons($item) {
     $connectBtn.IsEnabled = [bool]($item -and $item.Hostname)
+    if (-not $item -or -not $item.Hostname) {
+        $connectBtn.Content = 'Connect via VNC'
+        return
+    }
+
+    $connectSpec = Get-ConnectSpec $item
+    if ($connectSpec.Mode -eq 'RDP') {
+        $connectBtn.Content = 'Connect via RDP'
+    } else {
+        $connectBtn.Content = 'Connect via VNC'
+    }
 }
 
 function Show-StatusMessage([string]$message) {
@@ -1064,6 +1283,60 @@ function Show-StatusMessage([string]$message) {
     Update-StatusBar
     $script:StatusMessageTimer.Stop()
     $script:StatusMessageTimer.Start()
+}
+
+function Update-PasswordHint {
+    $passwordText = ''
+    if ($vncPasswordTextBox) {
+        $passwordText = $vncPasswordTextBox.Text
+    }
+
+    if (($vncPasswordBox -and $vncPasswordBox.Password.Length -gt 0) -or
+        (-not [string]::IsNullOrEmpty($passwordText))) {
+        $vncPasswordHint.Visibility = 'Collapsed'
+    } else {
+        $vncPasswordHint.Visibility = 'Visible'
+    }
+}
+
+function Sync-PasswordToTextBox {
+    if ($script:PasswordSyncInProgress -or -not $vncPasswordTextBox) { return }
+    $script:PasswordSyncInProgress = $true
+    try {
+        if ($vncPasswordTextBox.Text -ne $vncPasswordBox.Password) {
+            $vncPasswordTextBox.Text = $vncPasswordBox.Password
+        }
+    } finally {
+        $script:PasswordSyncInProgress = $false
+    }
+}
+
+function Sync-PasswordToPasswordBox {
+    if ($script:PasswordSyncInProgress -or -not $vncPasswordTextBox) { return }
+    $script:PasswordSyncInProgress = $true
+    try {
+        if ($vncPasswordBox.Password -ne $vncPasswordTextBox.Text) {
+            $vncPasswordBox.Password = $vncPasswordTextBox.Text
+        }
+    } finally {
+        $script:PasswordSyncInProgress = $false
+    }
+}
+
+function Show-PasswordReveal {
+    if (-not $vncPasswordTextBox) { return }
+    Sync-PasswordToTextBox
+    $vncPasswordBox.Visibility = 'Collapsed'
+    $vncPasswordTextBox.Visibility = 'Visible'
+    Update-PasswordHint
+}
+
+function Hide-PasswordReveal {
+    if (-not $vncPasswordTextBox) { return }
+    Sync-PasswordToPasswordBox
+    $vncPasswordTextBox.Visibility = 'Collapsed'
+    $vncPasswordBox.Visibility = 'Visible'
+    Update-PasswordHint
 }
 
 # ========================= VNC AUTO-DETECT ====================================
@@ -1401,20 +1674,8 @@ function Connect-VNC {
             "Cannot Connect", "OK", "Warning") | Out-Null
         return
     }
-    $vncExe = $script:VncExeResolved
-    if (-not $vncExe) {
-        [System.Windows.MessageBox]::Show(
-            "UltraVNC viewer not found.`n`nSearched in:`n  C:\Legacy\UltraVNC\UltraVNC-Viewer.exe`n  C:\Program Files\uvnc bvba\UltraVNC\vncviewer.exe`n  C:\Program Files (x86)\uvnc bvba\UltraVNC\vncviewer.exe`n  (and PATH / registry)`n`nUpdate VncExe in the Config section of SPC-Dashboard.ps1.",
-            "VNC Not Found", "OK", "Warning") | Out-Null
-        return
-    }
-    $pw = $vncPasswordBox.Password
-    if ([string]::IsNullOrEmpty($pw)) {
-        $vncPasswordBox.Focus() | Out-Null
-        Show-StatusMessage "Enter VNC password before connecting"
-        return
-    }
-    $connectHost = Get-ConnectTarget $item
+    $connectSpec = Get-ConnectSpec $item
+    $connectHost = $connectSpec.Host
     if (-not $connectHost) { $connectHost = $item.Hostname }
 
     # If still only a bare hostname (no dot), try on-the-fly DNS resolution with each suffix
@@ -1431,18 +1692,45 @@ function Connect-VNC {
                         $connectHost = $candidate
                         $hostKey = Get-HostLookupKey $item.Hostname
                         if ($hostKey) { $script:ResolvedHostCache[$hostKey] = $candidate }
+                        $item.ResolvedHost = $candidate
                         break
                     }
                 }
             } catch {}
         }
     }
-    # UltraVNC 1.6.x: -password must come BEFORE -connect (triggers immediate connection)
-    # Pass as array so that passwords with special chars are quoted correctly
-    $escapedPw = $pw -replace '"', '\"'
-    $argList   = @('-password', ('"' + $escapedPw + '"'), '-connect', ($connectHost + '::5900'))
+
+    if ($connectSpec.Mode -eq 'RDP') {
+        Start-Process -FilePath 'mstsc.exe' -ArgumentList @("/v:$connectHost")
+        Show-StatusMessage "Launching Remote Desktop for $connectHost"
+        return
+    }
+
+    $vncExe = $script:VncExeResolved
+    if (-not $vncExe) {
+        [System.Windows.MessageBox]::Show(
+            "UltraVNC viewer not found.`n`nSearched in:`n  C:\Legacy\UltraVNC\UltraVNC-Viewer.exe`n  C:\Program Files\uvnc bvba\UltraVNC\vncviewer.exe`n  C:\Program Files (x86)\uvnc bvba\UltraVNC\vncviewer.exe`n  (and PATH / registry)`n`nUpdate VncExe in the Config section of SPC-Dashboard.ps1.",
+            "VNC Not Found", "OK", "Warning") | Out-Null
+        return
+    }
+    $pw = $vncPasswordBox.Password
+    if ([string]::IsNullOrEmpty($pw)) {
+        $vncPasswordBox.Focus() | Out-Null
+        Show-StatusMessage "Enter VNC password before connecting"
+        return
+    }
+
+    $port = $connectSpec.Port
+    if ($port -le 0) {
+        $port = (@(Get-VncPorts))[0]
+    }
+
+    # UltraVNC 1.6.x standard target format is host::port.
+    # Pass as an argument array so that the password stays before -connect and special chars survive quoting.
+    $escapedPw = $pw -replace '"', '\\"'
+    $argList   = @('-password', ('"' + $escapedPw + '"'), '-connect', ('{0}::{1}' -f $connectHost, $port))
     Start-Process -FilePath $vncExe -ArgumentList $argList
-    Show-StatusMessage "Connecting to $connectHost..."
+    Show-StatusMessage ('Connecting to {0} on TCP:{1}...' -f $connectHost, $port)
 }
 
 # ============================== EVENT HANDLERS ===============================
@@ -1466,12 +1754,33 @@ $filterOfflineBtn.Add_Click({ Set-FilterSegment 'Offline' })
 
 # VNC password box: toggle hint visibility and auto-save on change
 $vncPasswordBox.Add_PasswordChanged({
-    if ($vncPasswordBox.Password.Length -gt 0) {
-        $vncPasswordHint.Visibility = 'Collapsed'
-    } else {
-        $vncPasswordHint.Visibility = 'Visible'
+    if (-not $script:PasswordSyncInProgress) {
+        Sync-PasswordToTextBox
     }
+    Update-PasswordHint
     Save-Settings $vncPasswordBox.Password
+})
+
+$vncPasswordTextBox.Add_TextChanged({
+    if (-not $script:PasswordSyncInProgress) {
+        Sync-PasswordToPasswordBox
+        Save-Settings $vncPasswordTextBox.Text
+    }
+    Update-PasswordHint
+})
+
+$vncPasswordRevealBtn.Add_PreviewMouseDown({
+    $vncPasswordRevealBtn.CaptureMouse() | Out-Null
+    Show-PasswordReveal
+})
+
+$vncPasswordRevealBtn.Add_PreviewMouseUp({
+    Hide-PasswordReveal
+    $vncPasswordRevealBtn.ReleaseMouseCapture()
+})
+
+$vncPasswordRevealBtn.Add_LostMouseCapture({
+    Hide-PasswordReveal
 })
 
 # Context menu: Copy hostname
@@ -1535,6 +1844,8 @@ $pingTimer.Add_Tick({
                 $item.LatencyMs       = $result.Latency
                 $item.ResolvedHost    = $result.ResolvedHost
                 $item.DetectionMethod = $result.DetectionMethod
+                $item.DetectedPort    = $result.DetectedPort
+                $item.ConnectionMode  = $result.ConnectionMode
                 $updated = $true
                 # Refresh detail panel status if this is the selected server
                 if ($script:SelectedItem -eq $item) {
@@ -1590,8 +1901,9 @@ $window.Add_Loaded({
     $savedPw = Load-Settings
     if ($savedPw) {
         $vncPasswordBox.Password    = $savedPw
-        $vncPasswordHint.Visibility = 'Collapsed'
+        Sync-PasswordToTextBox
     }
+    Update-PasswordHint
     # Initialize filter segments (All active by default)
     Set-FilterSegment 'All'
     Refresh-All
