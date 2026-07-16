@@ -26,12 +26,12 @@ $script:Config = @{
     CheckIntervalSeconds = 5
     # Maximum number of parallel host checks
     MaxConcurrentChecks = 25
-    # Per-host ping timeout in milliseconds
-    PingTimeoutMs      = 1500
+    # Per-host ping timeout in milliseconds (2000 = safer for corporate firewalls)
+    PingTimeoutMs      = 2000
     # Fallback VNC port check when ICMP is blocked
     TcpFallbackPort    = 5900
-    # Fallback TCP timeout in milliseconds
-    TcpFallbackTimeoutMs = 500
+    # Fallback TCP timeout in milliseconds (1500 = more lenient for slow networks)
+    TcpFallbackTimeoutMs = 1500
 }
 # ============================================================================
 
@@ -51,11 +51,12 @@ public class ServerItem : INotifyPropertyChanged {
     private string _status  = "checking";
     private long   _latency = -1L;
 
-    public string    DisplayName { get; set; }
-    public string    Hostname    { get; set; }
-    public string    ResolvedHost { get; set; }
-    public int       RowNumber   { get; set; }
-    public Hashtable RawData     { get; set; }
+    public string    DisplayName     { get; set; }
+    public string    Hostname        { get; set; }
+    public string    ResolvedHost    { get; set; }
+    public string    DetectionMethod { get; set; }
+    public int       RowNumber       { get; set; }
+    public Hashtable RawData         { get; set; }
 
     public string Status {
         get { return _status; }
@@ -197,8 +198,8 @@ function Read-ExcelServers {
                 $rowData[$colIdx] = & $getCellVal $cell
             }
 
-            $colA = if ($rowData.ContainsKey(0))  { $rowData[0]  } else { '' }
-            $colZ = if ($rowData.ContainsKey(25)) { $rowData[25] } else { '' }
+            $colA = if ($rowData.ContainsKey(0))  { ($rowData[0]).Trim()  } else { '' }
+            $colZ = if ($rowData.ContainsKey(25)) { ($rowData[25]).Trim() } else { '' }
 
             # Skip blank rows
             if (-not $colA -and -not $colZ) { continue }
@@ -340,6 +341,7 @@ if (-not $resolvedHost) {
 
 $status = 'offline'
 $latency = -1L
+$detectionMethod = ''
 if ($resolvedHost) {
     $ping = [System.Net.NetworkInformation.Ping]::new()
     try {
@@ -353,6 +355,7 @@ if ($resolvedHost) {
     if ($reply -and $reply.Status -eq [System.Net.NetworkInformation.IPStatus]::Success) {
         $status = 'online'
         $latency = [int64]$reply.RoundtripTime
+        $detectionMethod = 'ICMP'
     } else {
         $client = New-Object System.Net.Sockets.TcpClient
         $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
@@ -361,6 +364,7 @@ if ($resolvedHost) {
             if ($connectTask.Wait($TcpTimeoutMs) -and $client.Connected) {
                 $status = 'online'
                 $latency = [int64][Math]::Max(1, [Math]::Round($stopwatch.Elapsed.TotalMilliseconds))
+                $detectionMethod = "TCP:$TcpPort"
             }
         } catch {} finally {
             $stopwatch.Stop()
@@ -371,11 +375,12 @@ if ($resolvedHost) {
 }
 
 [pscustomobject]@{
-    HostKey      = $HostKey
-    ResolvedHost = $resolvedHost
-    Status       = $status
-    Latency      = $latency
-    CheckedAt    = [DateTime]::Now
+    HostKey         = $HostKey
+    ResolvedHost    = $resolvedHost
+    Status          = $status
+    Latency         = $latency
+    DetectionMethod = $detectionMethod
+    CheckedAt       = [DateTime]::Now
 }
 '@
 
@@ -415,11 +420,12 @@ if ($resolvedHost) {
                             $worker.State.CachedResolvedHost = $result.ResolvedHost
                         }
                         $resultQueue.Enqueue(@{
-                            HostKey = $result.HostKey
-                            ResolvedHost = $result.ResolvedHost
-                            Status = $result.Status
-                            Latency = $result.Latency
-                            CheckedAt = $result.CheckedAt
+                            HostKey         = $result.HostKey
+                            ResolvedHost    = $result.ResolvedHost
+                            Status          = $result.Status
+                            Latency         = $result.Latency
+                            DetectionMethod = $result.DetectionMethod
+                            CheckedAt       = $result.CheckedAt
                         })
                     }
                 }
@@ -650,6 +656,32 @@ $script:ColumnDefs = @(
       </Setter>
     </Style>
 
+    <!-- Segment (filter pill) button - Background/Foreground toggled in code -->
+    <Style x:Key="SegBtn" TargetType="Button">
+      <Setter Property="Foreground"      Value="#1C1C1E"/>
+      <Setter Property="Background"      Value="Transparent"/>
+      <Setter Property="FontSize"        Value="12"/>
+      <Setter Property="Padding"         Value="10,5"/>
+      <Setter Property="BorderThickness" Value="0"/>
+      <Setter Property="Cursor"          Value="Hand"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="Button">
+            <Border x:Name="Bd" CornerRadius="8"
+                    Background="{TemplateBinding Background}"
+                    Padding="{TemplateBinding Padding}">
+              <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+            </Border>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsMouseOver" Value="True">
+                <Setter TargetName="Bd" Property="Opacity" Value="0.85"/>
+              </Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+
   </Window.Resources>
 
   <Grid>
@@ -672,6 +704,7 @@ $script:ColumnDefs = @(
           <ColumnDefinition Width="Auto"/>
           <ColumnDefinition Width="Auto"/>
           <ColumnDefinition Width="Auto"/>
+          <ColumnDefinition Width="Auto"/>
         </Grid.ColumnDefinitions>
 
         <!-- App title -->
@@ -683,15 +716,25 @@ $script:ColumnDefs = @(
         </StackPanel>
 
         <!-- Search -->
-        <Grid Grid.Column="2" VerticalAlignment="Center" Margin="0,0,10,0" Width="240">
+        <Grid Grid.Column="2" VerticalAlignment="Center" Margin="0,0,10,0" Width="220">
           <TextBox x:Name="SearchBox" Style="{StaticResource SearchStyle}"/>
           <TextBlock x:Name="SearchHint" Text="Search name or hostname..."
                      IsHitTestVisible="False" VerticalAlignment="Center"
                      Margin="12,0" Foreground="#AEAEB2" FontSize="12"/>
         </Grid>
 
+        <!-- Filter segments: All | Online | Offline -->
+        <Border Grid.Column="3" VerticalAlignment="Center" Margin="0,0,10,0"
+                Background="#E5E5EA" CornerRadius="10" Padding="2">
+          <StackPanel Orientation="Horizontal">
+            <Button x:Name="FilterAllBtn"     Style="{StaticResource SegBtn}" Content="All"/>
+            <Button x:Name="FilterOnlineBtn"  Style="{StaticResource SegBtn}" Content="Online"/>
+            <Button x:Name="FilterOfflineBtn" Style="{StaticResource SegBtn}" Content="Offline"/>
+          </StackPanel>
+        </Border>
+
         <!-- Sort -->
-        <ComboBox x:Name="SortCombo" Grid.Column="3" VerticalAlignment="Center"
+        <ComboBox x:Name="SortCombo" Grid.Column="4" VerticalAlignment="Center"
                   Width="130" Margin="0,0,10,0" FontSize="12" Padding="8,6">
           <ComboBoxItem Content="Sort: Name"    Tag="Name"    IsSelected="True"/>
           <ComboBoxItem Content="Sort: Status"  Tag="Status"/>
@@ -699,7 +742,7 @@ $script:ColumnDefs = @(
         </ComboBox>
 
         <!-- Refresh -->
-        <Button x:Name="RefreshBtn" Grid.Column="4" Style="{StaticResource SecondaryBtn}"
+        <Button x:Name="RefreshBtn" Grid.Column="5" Style="{StaticResource SecondaryBtn}"
                 Content="Refresh" VerticalAlignment="Center"/>
       </Grid>
     </Border>
@@ -847,17 +890,27 @@ $reader = New-Object System.Xml.XmlNodeReader($xaml)
 $window = [System.Windows.Markup.XamlReader]::Load($reader)
 
 # Grab named controls
-$subTitle      = $window.FindName('SubTitle')
-$searchBox     = $window.FindName('SearchBox')
-$searchHint    = $window.FindName('SearchHint')
-$sortCombo     = $window.FindName('SortCombo')
-$refreshBtn    = $window.FindName('RefreshBtn')
-$serverList    = $window.FindName('ServerList')
-$detailContent = $window.FindName('DetailContent')
-$connectBtn    = $window.FindName('ConnectBtn')
-$statusBar     = $window.FindName('StatusBar')
-$autoRefLbl    = $window.FindName('AutoRefreshLbl')
-$creditBtn     = $window.FindName('CreditBtn')
+$subTitle        = $window.FindName('SubTitle')
+$searchBox       = $window.FindName('SearchBox')
+$searchHint      = $window.FindName('SearchHint')
+$sortCombo       = $window.FindName('SortCombo')
+$refreshBtn      = $window.FindName('RefreshBtn')
+$serverList      = $window.FindName('ServerList')
+$detailContent   = $window.FindName('DetailContent')
+$connectBtn      = $window.FindName('ConnectBtn')
+$statusBar       = $window.FindName('StatusBar')
+$autoRefLbl      = $window.FindName('AutoRefreshLbl')
+$creditBtn       = $window.FindName('CreditBtn')
+$filterAllBtn    = $window.FindName('FilterAllBtn')
+$filterOnlineBtn = $window.FindName('FilterOnlineBtn')
+$filterOfflineBtn= $window.FindName('FilterOfflineBtn')
+
+# Context menu on server list (created in code to avoid NameScope limitations)
+$ctxMenu = New-Object System.Windows.Controls.ContextMenu
+$copyHostMenuItem = New-Object System.Windows.Controls.MenuItem
+$copyHostMenuItem.Header = 'Copy Hostname'
+[void]$ctxMenu.Items.Add($copyHostMenuItem)
+$serverList.ContextMenu = $ctxMenu
 
 # Observable collection + collection view
 $script:ServerCollection = New-Object System.Collections.ObjectModel.ObservableCollection[object]
@@ -865,9 +918,11 @@ $serverList.ItemsSource  = $script:ServerCollection
 $script:CollView         = [System.Windows.Data.CollectionViewSource]::GetDefaultView($script:ServerCollection)
 
 # Fast lookup: Hostname -> ServerItem list
-$script:ServerLookup = @{}
-$script:ResolvedHostCache = @{}
-$script:LastStatusUpdate = $null
+$script:ServerLookup       = @{}
+$script:ResolvedHostCache  = @{}
+$script:LastStatusUpdate   = $null
+$script:StatusFilter       = 'All'
+$script:VncExeResolved     = $null
 
 # Track selected item for detail panel refresh
 $script:SelectedItem        = $null
@@ -927,6 +982,67 @@ function Show-StatusMessage([string]$message) {
     Update-StatusBar
     $script:StatusMessageTimer.Stop()
     $script:StatusMessageTimer.Start()
+}
+
+# ========================= VNC AUTO-DETECT ====================================
+function Resolve-VncExe {
+    # 1. Configured path (if set and exists)
+    if ($script:Config.VncExe -and (Test-Path -LiteralPath $script:Config.VncExe)) {
+        return $script:Config.VncExe
+    }
+    # 2-4. Known installation paths
+    $candidates = @(
+        'C:\Legacy\UltraVNC\UltraVNC-Viewer.exe',
+        'C:\Program Files\uvnc bvba\UltraVNC\vncviewer.exe',
+        'C:\Program Files (x86)\uvnc bvba\UltraVNC\vncviewer.exe'
+    )
+    foreach ($c in $candidates) {
+        if (Test-Path -LiteralPath $c) { return $c }
+    }
+    # 5. Search PATH
+    $fromPath = Get-Command 'vncviewer.exe' -ErrorAction SilentlyContinue
+    if ($fromPath) { return $fromPath.Source }
+    # 6. Registry App Paths
+    $regKeys = @(
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\vncviewer.exe',
+        'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\App Paths\vncviewer.exe'
+    )
+    foreach ($rk in $regKeys) {
+        if (Test-Path -LiteralPath $rk) {
+            try {
+                $val = (Get-ItemProperty -LiteralPath $rk -ErrorAction Stop).'(default)'
+                if ($val -and (Test-Path -LiteralPath $val)) { return $val }
+            } catch {}
+        }
+    }
+    return $null
+}
+
+# ========================= FILTER SEGMENT =====================================
+function Set-FilterSegment {
+    param([string]$active)
+    $script:StatusFilter = $active
+    $activeB   = New-Brush '#007AFF'
+    $inactiveB = [System.Windows.Media.Brushes]::Transparent
+    $activeF   = New-Brush '#FFFFFF'
+    $inactiveF = New-Brush '#1C1C1E'
+
+    if ($active -eq 'All') {
+        $filterAllBtn.Background = $activeB; $filterAllBtn.Foreground = $activeF
+    } else {
+        $filterAllBtn.Background = $inactiveB; $filterAllBtn.Foreground = $inactiveF
+    }
+    if ($active -eq 'Online') {
+        $filterOnlineBtn.Background = $activeB; $filterOnlineBtn.Foreground = $activeF
+    } else {
+        $filterOnlineBtn.Background = $inactiveB; $filterOnlineBtn.Foreground = $inactiveF
+    }
+    if ($active -eq 'Offline') {
+        $filterOfflineBtn.Background = $activeB; $filterOfflineBtn.Foreground = $activeF
+    } else {
+        $filterOfflineBtn.Background = $inactiveB; $filterOfflineBtn.Foreground = $inactiveF
+    }
+    Apply-Filter
 }
 
 # ============================ DETAIL PANEL ===================================
@@ -1009,7 +1125,10 @@ function Get-StatusColor([string]$status) {
 
 function Get-StatusText($item) {
     switch ($item.Status) {
-        'online'  { return "Online - $($item.LatencyMs) ms" }
+        'online'  {
+            $method = if ($item.DetectionMethod) { " ($($item.DetectionMethod))" } else { '' }
+            return "Online - $($item.LatencyMs) ms$method"
+        }
         'offline' { return 'Offline' }
         default   { return 'Checking...' }
     }
@@ -1064,12 +1183,21 @@ function Update-StatusBar {
     $offline  = ($script:ServerCollection | Where-Object Status -eq 'offline').Count
     $checking = ($script:ServerCollection | Where-Object Status -eq 'checking').Count
 
-    $text = "$total servers - "
-    $text += "$online online - $offline offline"
-    if ($checking -gt 0) { $text += " - $checking checking..." }
+    if ($checking -gt 0) {
+        $text = "Checking $checking servers... | $online online, $offline offline"
+    } else {
+        $text = "$total servers | $online online | $offline offline"
+    }
     if ($script:StatusMessage) { $text += " | $script:StatusMessage" }
     $statusBar.Text = $text
     $subTitle.Text  = "$online / $total online"
+
+    # Update filter segment labels with current counts
+    if ($filterAllBtn) {
+        $filterAllBtn.Content     = "All ($total)"
+        $filterOnlineBtn.Content  = "Online ($online)"
+        $filterOfflineBtn.Content = "Offline ($offline)"
+    }
 }
 
 # ============================== SORT / FILTER =================================
@@ -1089,15 +1217,23 @@ $script:CurrentFilter = ''
 function Apply-Filter {
     $ft = $searchBox.Text.Trim().ToLower()
     $script:CurrentFilter = $ft
-    if ($ft) {
+    if (-not $ft -and $script:StatusFilter -eq 'All') {
+        $script:CollView.Filter = $null
+    } else {
         $script:CollView.Filter = {
             param($obj)
             $s = [ServerItem]$obj
-            ($s.DisplayName -and $s.DisplayName.ToLower().Contains($script:CurrentFilter)) -or
-            ($s.Hostname    -and $s.Hostname.ToLower().Contains($script:CurrentFilter))
+            $textOk = if ($script:CurrentFilter) {
+                ($s.DisplayName -and $s.DisplayName.ToLower().Contains($script:CurrentFilter)) -or
+                ($s.Hostname    -and $s.Hostname.ToLower().Contains($script:CurrentFilter))
+            } else { $true }
+            $statusOk = switch ($script:StatusFilter) {
+                'Online'  { $s.Status -eq 'online' }
+                'Offline' { $s.Status -eq 'offline' }
+                default   { $true }
+            }
+            $textOk -and $statusOk
         }
-    } else {
-        $script:CollView.Filter = $null
     }
 }
 
@@ -1165,16 +1301,17 @@ function Connect-VNC {
             "Cannot Connect", "OK", "Warning") | Out-Null
         return
     }
-    if (-not (Test-Path $script:Config.VncExe)) {
+    $vncExe = $script:VncExeResolved
+    if (-not $vncExe) {
         [System.Windows.MessageBox]::Show(
-            "UltraVNC not found at:`n$($script:Config.VncExe)`n`nUpdate VncExe in SPC-Dashboard.ps1.",
+            "UltraVNC viewer not found.`n`nSearched in:`n  C:\Legacy\UltraVNC\UltraVNC-Viewer.exe`n  C:\Program Files\uvnc bvba\UltraVNC\vncviewer.exe`n  C:\Program Files (x86)\uvnc bvba\UltraVNC\vncviewer.exe`n  (and PATH / registry)`n`nUpdate VncExe in the Config section of SPC-Dashboard.ps1.",
             "VNC Not Found", "OK", "Warning") | Out-Null
         return
     }
-    $pw   = $script:Config.VncPassword
-    $host = Get-ConnectTarget $item
-    if (-not $host) { $host = $item.Hostname }
-    Start-Process -FilePath $script:Config.VncExe -ArgumentList "-password `"$pw`" -connect $host"
+    $pw          = $script:Config.VncPassword
+    $connectHost = Get-ConnectTarget $item
+    if (-not $connectHost) { $connectHost = $item.Hostname }
+    Start-Process -FilePath $vncExe -ArgumentList "-password `"$pw`" -connect $connectHost"
 }
 
 # ============================== EVENT HANDLERS ===============================
@@ -1190,6 +1327,32 @@ $sortCombo.Add_SelectionChanged({ Apply-Sort })
 
 # Refresh button
 $refreshBtn.Add_Click({ Refresh-All })
+
+# Filter segment buttons
+$filterAllBtn.Add_Click({     Set-FilterSegment 'All'     })
+$filterOnlineBtn.Add_Click({  Set-FilterSegment 'Online'  })
+$filterOfflineBtn.Add_Click({ Set-FilterSegment 'Offline' })
+
+# Context menu: Copy hostname
+$copyHostMenuItem.Add_Click({
+    $item = $serverList.SelectedItem -as [ServerItem]
+    if ($item -and $item.Hostname) {
+        [System.Windows.Clipboard]::SetText($item.Hostname)
+        Show-StatusMessage "Hostname '$($item.Hostname)' copied to clipboard"
+    }
+})
+
+# Right-click selects item under cursor so context menu has the right target
+$serverList.Add_PreviewMouseRightButtonDown({
+    $srcElem = $_.OriginalSource -as [System.Windows.FrameworkElement]
+    if ($srcElem) {
+        $cur = $srcElem
+        while ($cur -and -not ($cur -is [System.Windows.Controls.ListViewItem])) {
+            $cur = [System.Windows.Media.VisualTreeHelper]::GetParent($cur)
+        }
+        if ($cur) { $serverList.SelectedItem = $cur.DataContext }
+    }
+})
 
 # List selection -> update detail panel
 $serverList.Add_SelectionChanged({
@@ -1227,9 +1390,10 @@ $pingTimer.Add_Tick({
         $matchedItems = $script:ServerLookup[$result.HostKey]
         if ($matchedItems) {
             foreach ($item in $matchedItems) {
-                $item.Status    = $result.Status
-                $item.LatencyMs = $result.Latency
-                $item.ResolvedHost = $result.ResolvedHost
+                $item.Status          = $result.Status
+                $item.LatencyMs       = $result.Latency
+                $item.ResolvedHost    = $result.ResolvedHost
+                $item.DetectionMethod = $result.DetectionMethod
                 $updated = $true
                 # Refresh detail panel status if this is the selected server
                 if ($script:SelectedItem -eq $item) {
@@ -1239,7 +1403,10 @@ $pingTimer.Add_Tick({
         }
         $script:LastStatusUpdate = $result.CheckedAt
     }
-    if ($updated) { Update-StatusBar }
+    if ($updated) {
+        Update-StatusBar
+        if ($script:StatusFilter -ne 'All') { $script:CollView.Refresh() }
+    }
     if ($result) { Update-LiveMonitorLabel }
 })
 $pingTimer.Start()
@@ -1271,6 +1438,15 @@ function Register-FileWatcher {
 
 # ============================= WINDOW EVENTS ==================================
 $window.Add_Loaded({
+    # Auto-detect VNC viewer
+    $script:VncExeResolved = Resolve-VncExe
+    if ($script:VncExeResolved) {
+        $autoRefLbl.ToolTip = "VNC: $($script:VncExeResolved)"
+    } else {
+        $autoRefLbl.ToolTip = "VNC viewer not found - update VncExe in config"
+    }
+    # Initialize filter segments (All active by default)
+    Set-FilterSegment 'All'
     Refresh-All
     Register-FileWatcher
 })
@@ -1282,7 +1458,32 @@ $window.Add_Closed({
         $script:Watcher.Dispose()
     }
     Stop-LiveMonitor
+    # Save window position and size for next run
+    try {
+        $wsDir = Join-Path $env:APPDATA 'SPC-Dashboard'
+        if (-not (Test-Path $wsDir)) { New-Item -ItemType Directory -Path $wsDir -Force | Out-Null }
+        @{
+            Left   = [int]$window.Left
+            Top    = [int]$window.Top
+            Width  = [int]$window.Width
+            Height = [int]$window.Height
+        } | ConvertTo-Json | Set-Content -Path (Join-Path $wsDir 'window-state.json') -Encoding ASCII
+    } catch {}
 })
 
 # ================================= SHOW ======================================
+# Restore window position/size from previous session if available
+$wsFile = Join-Path $env:APPDATA 'SPC-Dashboard\window-state.json'
+if (Test-Path $wsFile) {
+    try {
+        $ws = Get-Content $wsFile -Raw -Encoding ASCII | ConvertFrom-Json
+        if ($ws.Width -ge 400 -and $ws.Width -le 3840) { $window.Width  = $ws.Width  }
+        if ($ws.Height -ge 300 -and $ws.Height -le 2160) { $window.Height = $ws.Height }
+        if ($ws.Left -gt -1921 -and $ws.Top -gt -100) {
+            $window.Left = $ws.Left
+            $window.Top  = $ws.Top
+            $window.WindowStartupLocation = [System.Windows.WindowStartupLocation]::Manual
+        }
+    } catch {}
+}
 [void]$window.ShowDialog()
