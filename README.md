@@ -48,14 +48,15 @@ $script:Config = @{
     # VNC password - set here OR via the VNC_PASSWORD environment variable
     VncPassword        = "CHANGE_ME"    # <-- replace with real password
 
-    # DNS suffixes tried when a bare hostname does not resolve
-    DnsSuffixes        = @('', 'niehlt.gft.ford.com', 'niehl.ford.com')
+    # DNS suffixes tried in order when a bare hostname (no dots) does not resolve.
+    # Add or reorder to match your network's DNS search list (run: ipconfig /all).
+    DnsSuffixes        = @('', 'niehl.gft.ford.com', 'niehl.ford.com', 'gft.ford.com', 'ford.com')
 
     # Target cadence for re-checking each host
     CheckIntervalSeconds = 5
 
-    # Maximum number of parallel host checks
-    MaxConcurrentChecks = 25
+    # Maximum number of parallel host checks (raise for larger server lists)
+    MaxConcurrentChecks = 50
 
     # Ping timeout per host (milliseconds)
     PingTimeoutMs      = 1500
