@@ -20,12 +20,13 @@ $script:Config = @{
     VncExe             = "C:\Legacy\UltraVNC\UltraVNC-Viewer.exe"
     # VNC password - DO NOT commit a real password; set it here or via env var $env:VNC_PASSWORD
     VncPassword        = if ($env:VNC_PASSWORD) { $env:VNC_PASSWORD } else { "CHANGE_ME" }
-    # DNS suffixes tried when a bare hostname does not resolve
-    DnsSuffixes        = @('', 'niehlt.gft.ford.com', 'niehl.ford.com')
+    # DNS suffixes tried in order when a bare hostname (no dots) does not resolve.
+    # Add or reorder to match your network's DNS search list (run: ipconfig /all).
+    DnsSuffixes        = @('', 'niehl.gft.ford.com', 'niehl.ford.com', 'gft.ford.com', 'ford.com')
     # Target cadence for re-checking each host
     CheckIntervalSeconds = 5
-    # Maximum number of parallel host checks
-    MaxConcurrentChecks = 25
+    # Maximum number of parallel host checks (raise for larger server lists)
+    MaxConcurrentChecks = 50
     # Per-host ping timeout in milliseconds (2000 = safer for corporate firewalls)
     PingTimeoutMs      = 2000
     # Fallback VNC port check when ICMP is blocked
@@ -928,6 +929,7 @@ $script:VncExeResolved     = $null
 $script:SelectedItem        = $null
 $script:DetailStatusDot     = $null
 $script:DetailStatusText    = $null
+$script:DetailResolvedText  = $null
 $script:StatusMessage       = $null
 $script:StatusMessageTimer  = New-Object System.Windows.Threading.DispatcherTimer
 $script:StatusMessageTimer.Interval = [TimeSpan]::FromSeconds(5)
@@ -1052,6 +1054,7 @@ function Update-DetailPanel {
     $detailContent.Children.Clear()
     $script:DetailStatusDot  = $null
     $script:DetailStatusText = $null
+    $script:DetailResolvedText = $null
     $script:SelectedItem     = $item
 
     if (-not $item) {
@@ -1104,6 +1107,20 @@ function Update-DetailPanel {
     $sep = New-Object System.Windows.Controls.Separator
     $sep.Margin = [System.Windows.Thickness]::new(0,0,0,12)
     [void]$detailContent.Children.Add($sep)
+
+    # Resolved FQDN row
+    $resolvedTb = New-Object System.Windows.Controls.TextBlock
+    $resolvedTb.FontSize = 11
+    $resolvedTb.Foreground = New-Brush '#8E8E93'
+    $resolvedTb.Margin = [System.Windows.Thickness]::new(0,0,0,10)
+    $resolvedTb.TextWrapping = 'Wrap'
+    if ($item.ResolvedHost) {
+        $resolvedTb.Text = "Resolved: $($item.ResolvedHost)"
+    } else {
+        $resolvedTb.Text = "Resolved: (resolving...)"
+    }
+    $script:DetailResolvedText = $resolvedTb
+    [void]$detailContent.Children.Add($resolvedTb)
 
     # Column values
     foreach ($cd in $script:ColumnDefs) {
@@ -1173,6 +1190,9 @@ function Refresh-DetailStatus {
     $script:DetailStatusDot.Fill  = $color
     $script:DetailStatusText.Text = Get-StatusText $item
     $script:DetailStatusText.Foreground = $color
+    if ($script:DetailResolvedText -and $item.ResolvedHost) {
+        $script:DetailResolvedText.Text = "Resolved: $($item.ResolvedHost)"
+    }
     Update-ActionButtons $item
 }
 
@@ -1311,6 +1331,27 @@ function Connect-VNC {
     $pw          = $script:Config.VncPassword
     $connectHost = Get-ConnectTarget $item
     if (-not $connectHost) { $connectHost = $item.Hostname }
+
+    # If still only a bare hostname (no dot), try on-the-fly DNS resolution with each suffix
+    if (-not $connectHost.Contains('.')) {
+        $dnsResolveTimeoutMs = 500
+        foreach ($suffix in $script:Config.DnsSuffixes) {
+            if ([string]::IsNullOrWhiteSpace($suffix)) { continue }
+            $candidate = "$($connectHost.Trim()).$($suffix.Trim())"
+            try {
+                $resolveTask = [System.Net.Dns]::GetHostAddressesAsync($candidate)
+                if ($resolveTask.Wait($dnsResolveTimeoutMs)) {
+                    $addresses = $resolveTask.Result
+                    if ($addresses -and $addresses.Length -gt 0) {
+                        $connectHost = $candidate
+                        $hostKey = Get-HostLookupKey $item.Hostname
+                        if ($hostKey) { $script:ResolvedHostCache[$hostKey] = $candidate }
+                        break
+                    }
+                }
+            } catch {}
+        }
+    }
     Start-Process -FilePath $vncExe -ArgumentList "-password `"$pw`" -connect $connectHost"
 }
 
