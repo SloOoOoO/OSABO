@@ -9,9 +9,8 @@ The dashboard continuously re-checks server status in the background and uses DN
 
 1. **Clone / download** this repository so `SPC-Dashboard.ps1`, `Start-Dashboard.bat`, and  
    `SPC-Gerätenliste_Gesamt_NEU.xlsm` are all in the **same folder**.
-2. **Set your VNC password** — see [Configuration](#configuration) below.  
-   ⚠️  Never commit a real password to the repository.
-3. **Double-click `Start-Dashboard.bat`** — the dashboard opens automatically.
+2. **Double-click `Start-Dashboard.bat`** — the dashboard opens automatically.
+3. **On first Connect**, enter VNC credentials in the popup dialog. They are saved for all clients and reused after reboot.
 
 ---
 
@@ -45,9 +44,6 @@ $script:Config = @{
     # Full path to the UltraVNC viewer executable
     VncExe             = "C:\Legacy\UltraVNC\UltraVNC-Viewer.exe"
 
-    # VNC password - set here OR via the VNC_PASSWORD environment variable
-    VncPassword        = "CHANGE_ME"    # <-- replace with real password
-
     # DNS suffixes tried in order when a bare hostname (no dots) does not resolve.
     # Add or reorder to match your network's DNS search list (run: ipconfig /all).
     DnsSuffixes        = @('', 'niehl.gft.ford.com', 'niehl.ford.com', 'gft.ford.com', 'ford.com')
@@ -62,24 +58,18 @@ $script:Config = @{
     PingTimeoutMs      = 2000
 
     # VNC ports probed and used for connection, in priority order.
-    # The legacy VNC default port was intentionally removed; Ford SPC uses 9506 primary and 3389 secondary.
-    VncPorts           = @(9506, 3389)
+    # 5900 is the UltraVNC default used by the legacy Excel VBA macro.
+    VncPorts           = @(5900, 9506, 3389)
 
     # Fallback TCP timeout in milliseconds
     TcpFallbackTimeoutMs = 1500
 }
 ```
 
-### Setting the password via environment variable (recommended)
+### Credentials storage
 
-Instead of editing the script, set the `VNC_PASSWORD` environment variable before launching:
-
-```batch
-:: In Start-Dashboard.bat, uncomment and edit this line:
-set VNC_PASSWORD=YourRealPasswordHere
-```
-
-The script reads `$env:VNC_PASSWORD` at startup and prefers it over the hardcoded value.
+The dashboard stores credentials in `%APPDATA%\SPC-Dashboard\settings.json` using DPAPI encryption for the password (`ConvertFrom-SecureString`).  
+Use the **Credentials...** button in the header to update them later.
 
 ---
 
@@ -88,10 +78,10 @@ The script reads `$env:VNC_PASSWORD` at startup and prefers it over the hardcode
 | Action | How |
 |---|---|
 | **View server list** | All SPC servers from the Excel file are listed with live online-status indicators |
-| **Filter** | Type in the Search box — filters by SPC name or hostname in real time |
+| **Filter** | Type in the Search box — case-insensitive contains match across all loaded Excel fields |
 | **Sort** | Use the Sort drop-down in the header (Name / Status / Latency) |
 | **See details** | Click any server — all Excel columns appear in the right-hand panel |
-| **Connect via VNC** | Double-click any server **or** select it and click **Connect via VNC**. The dashboard reuses the last resolved FQDN, connects UltraVNC to the detected VNC port (9506 primary, 3389 secondary), and defaults to 9506 when a host is only reachable by ICMP |
+| **Connect via VNC** | Double-click any server **or** select it and click **Connect via VNC**. First attempt mirrors the working VBA flow: `-password <pw> -connect <bare-hostname>` (with optional `-user` before `-password`). Fallback offers `-connect <resolved-fqdn>`. `::port` is appended only when detected port is not 5900 |
 | **Manual refresh** | Click **↺ Refresh** in the header |
 | **Live monitoring** | A background runspace continuously re-checks hosts in parallel batches; the footer shows `Live monitoring` with the last status update time |
 | **Excel hot-reload** | When the `.xlsm` file is saved/updated, the list reloads automatically and the live monitor restarts with a fresh DNS cache |
@@ -159,7 +149,7 @@ Save the file. If the dashboard is already open, it reloads automatically within
 |---|---|
 | "Excel file not found" error | Ensure the `.xlsm` file is in the same folder as `SPC-Dashboard.ps1`, or update `ExcelFile` in the config |
 | "VNC Not Found" dialog | Update `VncExe` in the config to the correct path |
-| Most servers show offline | Verify `DnsSuffixes` includes the correct Ford domains for your site and keep `VncPorts` set to the VNC ports your site uses (Ford SPC defaults to `@(9506, 3389)`) |
+| Most servers show offline | Verify `DnsSuffixes` includes the correct Ford domains for your site and keep `VncPorts` set to the VNC ports your site uses (Ford SPC defaults to `@(5900, 9506, 3389)`) |
 | Status updates feel slow | Increase `MaxConcurrentChecks` or lower `CheckIntervalSeconds` carefully; the defaults are tuned for about 160 SPC hosts |
 | Script won't run | Right-click `Start-Dashboard.bat` → *Run as administrator* |
 | Script blocked by policy | The `.bat` launcher already passes `-ExecutionPolicy Bypass`; if blocked further, check Group Policy |
