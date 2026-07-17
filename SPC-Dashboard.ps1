@@ -1234,8 +1234,8 @@ function Show-CredentialsDialog {
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         Title="VNC Credentials"
-        Width="420" Height="238"
-        MinWidth="420" MinHeight="238" MaxWidth="420" MaxHeight="238"
+        SizeToContent="WidthAndHeight"
+        Width="420" MinWidth="420" MaxWidth="420"
         ResizeMode="NoResize"
         WindowStartupLocation="CenterOwner"
         Background="#F2F2F7"
@@ -1248,14 +1248,16 @@ function Show-CredentialsDialog {
         <RowDefinition Height="Auto"/>
         <RowDefinition Height="Auto"/>
         <RowDefinition Height="Auto"/>
-        <RowDefinition Height="*"/>
+        <RowDefinition Height="Auto"/>
+        <RowDefinition Height="Auto"/>
       </Grid.RowDefinitions>
       <TextBlock Grid.Row="0" Text="VNC Credentials" FontSize="18" FontWeight="SemiBold" Foreground="#1C1C1E"/>
       <TextBlock Grid.Row="1" Margin="0,8,0,14" Text="Saved once and reused for all clients." FontSize="12" Foreground="#8E8E93"/>
       <TextBlock Grid.Row="2" Text="Username (optional)" FontSize="12" Foreground="#6E6E73"/>
       <TextBox x:Name="UsernameBox" Grid.Row="3" Margin="0,4,0,12" Height="34" VerticalContentAlignment="Center"
                FontSize="13" Padding="10,0" BorderBrush="#D1D1D6" BorderThickness="1"/>
-      <Grid Grid.Row="4" Margin="0,0,0,12">
+      <TextBlock Grid.Row="4" Text="Password (required)" FontSize="12" Foreground="#6E6E73"/>
+      <Grid Grid.Row="5" Margin="0,4,0,12">
         <Grid.ColumnDefinitions>
           <ColumnDefinition Width="*"/>
           <ColumnDefinition Width="34"/>
@@ -1274,7 +1276,7 @@ function Show-CredentialsDialog {
           </Viewbox>
         </Button>
       </Grid>
-      <Grid Grid.Row="5">
+      <Grid Grid.Row="6" Margin="0,0,0,4">
         <Grid.ColumnDefinitions>
           <ColumnDefinition Width="*"/>
           <ColumnDefinition Width="Auto"/>
@@ -1282,9 +1284,11 @@ function Show-CredentialsDialog {
           <ColumnDefinition Width="Auto"/>
         </Grid.ColumnDefinitions>
         <Button x:Name="CancelBtn" Grid.Column="1" Content="Cancel" Width="86" Height="32"
-                Background="#E5E5EA" Foreground="#1C1C1E" BorderThickness="0" Cursor="Hand"/>
+                Background="#E5E5EA" Foreground="#1C1C1E" BorderThickness="0" Cursor="Hand"
+                IsCancel="True"/>
         <Button x:Name="OkBtn" Grid.Column="3" Content="OK" Width="86" Height="32"
-                Background="#007AFF" Foreground="White" BorderThickness="0" Cursor="Hand"/>
+                Background="#007AFF" Foreground="White" BorderThickness="0" Cursor="Hand"
+                IsDefault="True"/>
       </Grid>
     </Grid>
   </Border>
@@ -1737,12 +1741,26 @@ function Start-VncViewer {
         [string]$ConnectTarget
     )
 
+    if ([string]::IsNullOrWhiteSpace($VncExe)) {
+        throw "VNC viewer path is empty."
+    }
     $argList = @()
     if (-not [string]::IsNullOrWhiteSpace($Username)) {
         $argList += @('-user', $Username)
     }
     $argList += @('-password', $Password, '-connect', $ConnectTarget)
-    return Start-Process -FilePath $VncExe -ArgumentList $argList -PassThru
+    $exeName = [System.IO.Path]::GetFileName($VncExe)
+    $logArgs = @()
+    if (-not [string]::IsNullOrWhiteSpace($Username)) {
+        $logArgs += @('-user', $Username)
+    }
+    $logArgs += @('-password', '***', '-connect', $ConnectTarget)
+    Show-StatusMessage ('Launching: {0} {1}' -f $exeName, ($logArgs -join ' '))
+    try {
+        return Start-Process -FilePath $VncExe -ArgumentList $argList -PassThru -ErrorAction Stop
+    } catch {
+        throw ('Failed to launch {0}: {1}' -f $exeName, $_.Exception.Message)
+    }
 }
 
 function Connect-VNC {
@@ -1788,10 +1806,15 @@ function Connect-VNC {
         $fallbackTarget = Get-VncConnectTarget -host $resolvedHost -port $port
     }
 
-    $proc = Start-VncViewer -VncExe $vncExe -Username $creds.Username -Password $creds.Password -ConnectTarget $firstTarget
-    Show-StatusMessage ('Connecting to {0} (detected TCP:{1})...' -f $bareHostname, $port)
+    $proc = $null
+    try {
+        $proc = Start-VncViewer -VncExe $vncExe -Username $creds.Username -Password $creds.Password -ConnectTarget $firstTarget
+    } catch {
+        Show-StatusMessage ('VNC launch failed: {0}' -f $_.Exception.Message)
+        return
+    }
 
-    if ($fallbackTarget) {
+    if ($fallbackTarget -and $proc) {
         if ($proc.WaitForExit(1200)) {
             $tryFallback = [System.Windows.MessageBox]::Show(
                 $window,
@@ -1801,8 +1824,11 @@ function Connect-VNC {
                 [System.Windows.MessageBoxImage]::Question
             )
             if ($tryFallback -eq [System.Windows.MessageBoxResult]::Yes) {
-                Start-VncViewer -VncExe $vncExe -Username $creds.Username -Password $creds.Password -ConnectTarget $fallbackTarget | Out-Null
-                Show-StatusMessage ('Fallback connect to {0} (detected TCP:{1})...' -f $resolvedHost, $port)
+                try {
+                    Start-VncViewer -VncExe $vncExe -Username $creds.Username -Password $creds.Password -ConnectTarget $fallbackTarget | Out-Null
+                } catch {
+                    Show-StatusMessage ('VNC fallback launch failed: {0}' -f $_.Exception.Message)
+                }
             }
         }
     }
