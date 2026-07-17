@@ -61,12 +61,9 @@ $script:Config = @{
     # Ping timeout per host (milliseconds)
     PingTimeoutMs      = 2000
 
-    # Candidate VNC listener ports checked in order; Ford SPC uses 9506 by default.
-    # Re-add 5900 here later if a site still needs it.
-    VncPorts           = @(9506)
-
-    # Remote Desktop fallback port; if this alone answers, Connect launches mstsc.
-    RdpPort            = 3389
+    # VNC ports probed and used for connection, in priority order.
+    # The legacy VNC default port was intentionally removed; Ford SPC uses 9506 primary and 3389 secondary.
+    VncPorts           = @(9506, 3389)
 
     # Fallback TCP timeout in milliseconds
     TcpFallbackTimeoutMs = 1500
@@ -94,7 +91,7 @@ The script reads `$env:VNC_PASSWORD` at startup and prefers it over the hardcode
 | **Filter** | Type in the Search box — filters by SPC name or hostname in real time |
 | **Sort** | Use the Sort drop-down in the header (Name / Status / Latency) |
 | **See details** | Click any server — all Excel columns appear in the right-hand panel |
-| **Connect via VNC** | Double-click any server **or** select it and click **Connect via VNC**. The dashboard reuses the last resolved FQDN, connects UltraVNC to the detected VNC port (9506 by default), and falls back to mstsc when only TCP:3389 answers |
+| **Connect via VNC** | Double-click any server **or** select it and click **Connect via VNC**. The dashboard reuses the last resolved FQDN, connects UltraVNC to the detected VNC port (9506 primary, 3389 secondary), and defaults to 9506 when a host is only reachable by ICMP |
 | **Manual refresh** | Click **↺ Refresh** in the header |
 | **Live monitoring** | A background runspace continuously re-checks hosts in parallel batches; the footer shows `Live monitoring` with the last status update time |
 | **Excel hot-reload** | When the `.xlsm` file is saved/updated, the list reloads automatically and the live monitor restarts with a fresh DNS cache |
@@ -162,7 +159,7 @@ Save the file. If the dashboard is already open, it reloads automatically within
 |---|---|
 | "Excel file not found" error | Ensure the `.xlsm` file is in the same folder as `SPC-Dashboard.ps1`, or update `ExcelFile` in the config |
 | "VNC Not Found" dialog | Update `VncExe` in the config to the correct path |
-| Most servers show offline | Verify `DnsSuffixes` includes the correct Ford domains for your site and keep `VncPorts` set to the VNC ports your site uses (Ford SPC defaults to `@(9506)`) while leaving `RdpPort` at `3389` for Remote Desktop fallback |
+| Most servers show offline | Verify `DnsSuffixes` includes the correct Ford domains for your site and keep `VncPorts` set to the VNC ports your site uses (Ford SPC defaults to `@(9506, 3389)`) |
 | Status updates feel slow | Increase `MaxConcurrentChecks` or lower `CheckIntervalSeconds` carefully; the defaults are tuned for about 160 SPC hosts |
 | Script won't run | Right-click `Start-Dashboard.bat` → *Run as administrator* |
 | Script blocked by policy | The `.bat` launcher already passes `-ExecutionPolicy Bypass`; if blocked further, check Group Policy |
