@@ -18,8 +18,6 @@ $script:Config = @{
     DataStartRow       = 3
     # UltraVNC executable path
     VncExe             = "C:\Legacy\UltraVNC\UltraVNC-Viewer.exe"
-    # VNC password - DO NOT commit a real password; set it here or via env var $env:VNC_PASSWORD
-    VncPassword        = if ($env:VNC_PASSWORD) { $env:VNC_PASSWORD } else { "CHANGE_ME" }
     # DNS suffixes tried in order when a bare hostname (no dots) does not resolve.
     # Add or reorder to match your network's DNS search list (run: ipconfig /all).
     DnsSuffixes        = @('', 'niehl.gft.ford.com', 'niehl.ford.com', 'gft.ford.com', 'ford.com')
@@ -30,8 +28,8 @@ $script:Config = @{
     # Per-host ping timeout in milliseconds (2000 = safer for corporate firewalls)
     PingTimeoutMs      = 2000
     # VNC ports probed and used for connection, in priority order.
-    # The legacy VNC default port was intentionally removed; Ford SPC uses 9506 primary and 3389 secondary.
-    VncPorts           = @(9506, 3389)
+    # 5900 is the UltraVNC default used by the working Excel VBA macro.
+    VncPorts           = @(5900, 9506, 3389)
     # Per-port TCP timeout in milliseconds (1500 = more lenient for slow networks)
     TcpFallbackTimeoutMs = 1500
 }
@@ -863,7 +861,7 @@ $script:ColumnDefs = @(
         <!-- Search -->
         <Grid Grid.Column="2" VerticalAlignment="Center" Margin="0,0,10,0" Width="220">
           <TextBox x:Name="SearchBox" Style="{StaticResource SearchStyle}"/>
-          <TextBlock x:Name="SearchHint" Text="Search name or hostname..."
+          <TextBlock x:Name="SearchHint" Text="Search all fields..."
                      IsHitTestVisible="False" VerticalAlignment="Center"
                      Margin="12,0" Foreground="#AEAEB2" FontSize="12"/>
         </Grid>
@@ -886,32 +884,8 @@ $script:ColumnDefs = @(
           <ComboBoxItem Content="Sort: Latency" Tag="Latency"/>
         </ComboBox>
 
-        <!-- VNC Password -->
-        <Grid Grid.Column="5" VerticalAlignment="Center" Margin="0,0,10,0" Width="184">
-          <Grid.ColumnDefinitions>
-            <ColumnDefinition Width="*"/>
-            <ColumnDefinition Width="34"/>
-          </Grid.ColumnDefinitions>
-          <Grid Grid.Column="0">
-            <PasswordBox x:Name="VncPasswordBox" Style="{StaticResource PwdStyle}"/>
-            <TextBox x:Name="VncPasswordTextBox" Style="{StaticResource PwdRevealTextStyle}"
-                     Visibility="Collapsed"/>
-            <TextBlock x:Name="VncPasswordHint" Text="VNC password"
-                       IsHitTestVisible="False" VerticalAlignment="Center"
-                       Margin="12,0" Foreground="#AEAEB2" FontSize="12"/>
-          </Grid>
-          <Button x:Name="VncPasswordRevealBtn" Grid.Column="1" Margin="6,0,0,0"
-                  Style="{StaticResource EyeBtn}">
-            <Viewbox Width="14" Height="10">
-              <Grid>
-                <Path Data="M 1 5 C 3 1, 11 1, 13 5 C 11 9, 3 9, 1 5 Z"
-                      Stroke="#6E6E73" StrokeThickness="1.2" Stretch="Fill"/>
-                <Ellipse Width="3.4" Height="3.4" Stroke="#6E6E73"
-                         StrokeThickness="1.2" Fill="Transparent"/>
-              </Grid>
-            </Viewbox>
-          </Button>
-        </Grid>
+        <Button x:Name="CredentialsBtn" Grid.Column="5" Style="{StaticResource SecondaryBtn}"
+                Content="Credentials..." VerticalAlignment="Center" Margin="0,0,10,0"/>
 
         <!-- Refresh -->
         <Button x:Name="RefreshBtn" Grid.Column="6" Style="{StaticResource SecondaryBtn}"
@@ -1076,10 +1050,7 @@ $creditBtn       = $window.FindName('CreditBtn')
 $filterAllBtn    = $window.FindName('FilterAllBtn')
 $filterOnlineBtn = $window.FindName('FilterOnlineBtn')
 $filterOfflineBtn= $window.FindName('FilterOfflineBtn')
-$vncPasswordBox  = $window.FindName('VncPasswordBox')
-$vncPasswordTextBox = $window.FindName('VncPasswordTextBox')
-$vncPasswordHint = $window.FindName('VncPasswordHint')
-$vncPasswordRevealBtn = $window.FindName('VncPasswordRevealBtn')
+$credentialsBtn  = $window.FindName('CredentialsBtn')
 
 # Context menu on server list (created in code to avoid NameScope limitations)
 $ctxMenu = New-Object System.Windows.Controls.ContextMenu
@@ -1099,7 +1070,7 @@ $script:ResolvedHostCache  = @{}
 $script:LastStatusUpdate   = $null
 $script:StatusFilter       = 'All'
 $script:VncExeResolved     = $null
-$script:PasswordSyncInProgress = $false
+$script:VncCredentials     = $null
 
 # Track selected item for detail panel refresh
 $script:SelectedItem        = $null
@@ -1115,41 +1086,47 @@ $script:StatusMessageTimer.Add_Tick({
     Update-StatusBar
 })
 
-# ====================== SETTINGS (password persistence) ======================
+# ====================== SETTINGS (credentials persistence) ===================
 $script:SettingsDir  = Join-Path $env:APPDATA 'SPC-Dashboard'
 $script:SettingsFile = Join-Path $script:SettingsDir 'settings.json'
 
 function Load-Settings {
+    $username = ''
     $pw = ''
     if (Test-Path $script:SettingsFile) {
         try {
             $s = Get-Content $script:SettingsFile -Raw -Encoding ASCII | ConvertFrom-Json
+            if ($s.VncUsername) {
+                $username = [string]$s.VncUsername
+            }
             if ($s.VncPasswordEncrypted) {
                 $ss   = ConvertTo-SecureString $s.VncPasswordEncrypted -ErrorAction Stop
                 $bstr = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($ss)
                 $pw   = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto($bstr)
                 [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
             }
-        } catch { $pw = '' }
-    }
-    if (-not $pw) {
-        if ($env:VNC_PASSWORD) {
-            $pw = $env:VNC_PASSWORD
-        } elseif ($script:Config.VncPassword -and $script:Config.VncPassword -ne 'CHANGE_ME') {
-            $pw = $script:Config.VncPassword
+        } catch {
+            $username = ''
+            $pw = ''
         }
     }
-    return $pw
+    return [pscustomobject]@{
+        Username = $username
+        Password = $pw
+    }
 }
 
-function Save-Settings([string]$plainPassword) {
+function Save-Settings([string]$username, [string]$plainPassword) {
     try {
         if (-not (Test-Path $script:SettingsDir)) {
             New-Item -ItemType Directory -Path $script:SettingsDir -Force | Out-Null
         }
         $ss        = ConvertTo-SecureString $plainPassword -AsPlainText -Force
         $encrypted = ConvertFrom-SecureString $ss
-        @{ VncPasswordEncrypted = $encrypted } |
+        @{
+            VncUsername = $username
+            VncPasswordEncrypted = $encrypted
+        } |
             ConvertTo-Json |
             Set-Content -Path $script:SettingsFile -Encoding ASCII
     } catch {}
@@ -1176,7 +1153,7 @@ function Get-VncPorts {
         }
     }
     if ($ports.Count -eq 0) {
-        $ports.Add(9506) | Out-Null
+        $ports.Add(5900) | Out-Null
     }
     return $ports.ToArray()
 }
@@ -1247,58 +1224,155 @@ function Show-StatusMessage([string]$message) {
     $script:StatusMessageTimer.Start()
 }
 
-function Update-PasswordHint {
-    $passwordText = ''
-    if ($vncPasswordTextBox) {
-        $passwordText = $vncPasswordTextBox.Text
+function Show-CredentialsDialog {
+    param(
+        [string]$InitialUsername,
+        [string]$InitialPassword
+    )
+
+    [xml]$dialogXaml = @'
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="VNC Credentials"
+        Width="420" Height="238"
+        MinWidth="420" MinHeight="238" MaxWidth="420" MaxHeight="238"
+        ResizeMode="NoResize"
+        WindowStartupLocation="CenterOwner"
+        Background="#F2F2F7"
+        ShowInTaskbar="False">
+  <Border Background="White" CornerRadius="12" Margin="14">
+    <Grid Margin="16">
+      <Grid.RowDefinitions>
+        <RowDefinition Height="Auto"/>
+        <RowDefinition Height="Auto"/>
+        <RowDefinition Height="Auto"/>
+        <RowDefinition Height="Auto"/>
+        <RowDefinition Height="Auto"/>
+        <RowDefinition Height="*"/>
+      </Grid.RowDefinitions>
+      <TextBlock Grid.Row="0" Text="VNC Credentials" FontSize="18" FontWeight="SemiBold" Foreground="#1C1C1E"/>
+      <TextBlock Grid.Row="1" Margin="0,8,0,14" Text="Saved once and reused for all clients." FontSize="12" Foreground="#8E8E93"/>
+      <TextBlock Grid.Row="2" Text="Username (optional)" FontSize="12" Foreground="#6E6E73"/>
+      <TextBox x:Name="UsernameBox" Grid.Row="3" Margin="0,4,0,12" Height="34" VerticalContentAlignment="Center"
+               FontSize="13" Padding="10,0" BorderBrush="#D1D1D6" BorderThickness="1"/>
+      <Grid Grid.Row="4" Margin="0,0,0,12">
+        <Grid.ColumnDefinitions>
+          <ColumnDefinition Width="*"/>
+          <ColumnDefinition Width="34"/>
+        </Grid.ColumnDefinitions>
+        <PasswordBox x:Name="PasswordBox" Grid.Column="0" Height="34" VerticalContentAlignment="Center"
+                     FontSize="13" Padding="10,0" BorderBrush="#D1D1D6" BorderThickness="1"/>
+        <TextBox x:Name="PasswordRevealBox" Grid.Column="0" Height="34" VerticalContentAlignment="Center"
+                 FontSize="13" Padding="10,0" BorderBrush="#D1D1D6" BorderThickness="1" Visibility="Collapsed"/>
+        <Button x:Name="RevealBtn" Grid.Column="1" Margin="6,0,0,0" Width="28" Height="28" Padding="6"
+                Background="#F2F2F7" BorderBrush="#D1D1D6" BorderThickness="1" Cursor="Hand" VerticalAlignment="Center">
+          <Viewbox Width="14" Height="10">
+            <Grid>
+              <Path Data="M 1 5 C 3 1, 11 1, 13 5 C 11 9, 3 9, 1 5 Z" Stroke="#6E6E73" StrokeThickness="1.2" Stretch="Fill"/>
+              <Ellipse Width="3.4" Height="3.4" Stroke="#6E6E73" StrokeThickness="1.2" Fill="Transparent"/>
+            </Grid>
+          </Viewbox>
+        </Button>
+      </Grid>
+      <Grid Grid.Row="5">
+        <Grid.ColumnDefinitions>
+          <ColumnDefinition Width="*"/>
+          <ColumnDefinition Width="Auto"/>
+          <ColumnDefinition Width="8"/>
+          <ColumnDefinition Width="Auto"/>
+        </Grid.ColumnDefinitions>
+        <Button x:Name="CancelBtn" Grid.Column="1" Content="Cancel" Width="86" Height="32"
+                Background="#E5E5EA" Foreground="#1C1C1E" BorderThickness="0" Cursor="Hand"/>
+        <Button x:Name="OkBtn" Grid.Column="3" Content="OK" Width="86" Height="32"
+                Background="#007AFF" Foreground="White" BorderThickness="0" Cursor="Hand"/>
+      </Grid>
+    </Grid>
+  </Border>
+</Window>
+'@
+
+    $dialogReader = New-Object System.Xml.XmlNodeReader($dialogXaml)
+    $dialog = [System.Windows.Markup.XamlReader]::Load($dialogReader)
+    $dialog.Owner = $window
+
+    $usernameBox = $dialog.FindName('UsernameBox')
+    $passwordBox = $dialog.FindName('PasswordBox')
+    $passwordRevealBox = $dialog.FindName('PasswordRevealBox')
+    $revealBtn = $dialog.FindName('RevealBtn')
+    $okBtn = $dialog.FindName('OkBtn')
+    $cancelBtn = $dialog.FindName('CancelBtn')
+
+    $usernameBox.Text = $InitialUsername
+    $passwordBox.Password = $InitialPassword
+
+    $showReveal = {
+        $passwordRevealBox.Text = $passwordBox.Password
+        $passwordBox.Visibility = 'Collapsed'
+        $passwordRevealBox.Visibility = 'Visible'
+    }
+    $hideReveal = {
+        $passwordBox.Password = $passwordRevealBox.Text
+        $passwordRevealBox.Visibility = 'Collapsed'
+        $passwordBox.Visibility = 'Visible'
     }
 
-    if (($vncPasswordBox -and $vncPasswordBox.Password.Length -gt 0) -or
-        (-not [string]::IsNullOrEmpty($passwordText))) {
-        $vncPasswordHint.Visibility = 'Collapsed'
-    } else {
-        $vncPasswordHint.Visibility = 'Visible'
-    }
-}
+    $revealBtn.Add_PreviewMouseDown({
+        $revealBtn.CaptureMouse() | Out-Null
+        & $showReveal
+    })
+    $revealBtn.Add_PreviewMouseUp({
+        & $hideReveal
+        $revealBtn.ReleaseMouseCapture()
+    })
+    $revealBtn.Add_LostMouseCapture({ & $hideReveal })
 
-function Sync-PasswordToTextBox {
-    if ($script:PasswordSyncInProgress -or -not $vncPasswordTextBox) { return }
-    $script:PasswordSyncInProgress = $true
-    try {
-        if ($vncPasswordTextBox.Text -ne $vncPasswordBox.Password) {
-            $vncPasswordTextBox.Text = $vncPasswordBox.Password
+    $result = $null
+    $okBtn.Add_Click({
+        & $hideReveal
+        if ([string]::IsNullOrWhiteSpace($passwordBox.Password)) {
+            [System.Windows.MessageBox]::Show($dialog, "Password is required.", "VNC Credentials", "OK", "Warning") | Out-Null
+            $passwordBox.Focus() | Out-Null
+            return
         }
-    } finally {
-        $script:PasswordSyncInProgress = $false
-    }
-}
-
-function Sync-PasswordToPasswordBox {
-    if ($script:PasswordSyncInProgress -or -not $vncPasswordTextBox) { return }
-    $script:PasswordSyncInProgress = $true
-    try {
-        if ($vncPasswordBox.Password -ne $vncPasswordTextBox.Text) {
-            $vncPasswordBox.Password = $vncPasswordTextBox.Text
+        $result = [pscustomobject]@{
+            Username = $usernameBox.Text
+            Password = $passwordBox.Password
         }
-    } finally {
-        $script:PasswordSyncInProgress = $false
+        $dialog.DialogResult = $true
+        $dialog.Close()
+    })
+    $cancelBtn.Add_Click({
+        $dialog.DialogResult = $false
+        $dialog.Close()
+    })
+
+    $dialog.ShowDialog() | Out-Null
+    return $result
+}
+
+function Get-VncCredentials([bool]$ForcePrompt) {
+    if (-not $ForcePrompt -and $script:VncCredentials -and -not [string]::IsNullOrWhiteSpace($script:VncCredentials.Password)) {
+        return $script:VncCredentials
     }
-}
 
-function Show-PasswordReveal {
-    if (-not $vncPasswordTextBox) { return }
-    Sync-PasswordToTextBox
-    $vncPasswordBox.Visibility = 'Collapsed'
-    $vncPasswordTextBox.Visibility = 'Visible'
-    Update-PasswordHint
-}
+    $initialUsername = ''
+    $initialPassword = ''
+    if ($script:VncCredentials) {
+        $initialUsername = [string]$script:VncCredentials.Username
+        $initialPassword = [string]$script:VncCredentials.Password
+    }
 
-function Hide-PasswordReveal {
-    if (-not $vncPasswordTextBox) { return }
-    Sync-PasswordToPasswordBox
-    $vncPasswordTextBox.Visibility = 'Collapsed'
-    $vncPasswordBox.Visibility = 'Visible'
-    Update-PasswordHint
+    $creds = Show-CredentialsDialog -InitialUsername $initialUsername -InitialPassword $initialPassword
+    if (-not $creds) { return $null }
+
+    $normalizedUsername = ''
+    if ($creds.Username) { $normalizedUsername = $creds.Username.Trim() }
+    $script:VncCredentials = [pscustomobject]@{
+        Username = $normalizedUsername
+        Password = [string]$creds.Password
+    }
+    Save-Settings $script:VncCredentials.Username $script:VncCredentials.Password
+    return $script:VncCredentials
 }
 
 # ========================= VNC AUTO-DETECT ====================================
@@ -1437,6 +1511,9 @@ function Update-DetailPanel {
     $script:DetailResolvedText = $resolvedTb
     [void]$detailContent.Children.Add($resolvedTb)
 
+    $detectedPortText = if ($item.DetectedPort -gt 0) { [string]$item.DetectedPort } else { '-' }
+    Add-DetailRow 'Detected Port' $detectedPortText
+
     # Column values
     foreach ($cd in $script:ColumnDefs) {
         $val = if ($item.RawData.Contains($cd.Index)) { $item.RawData[$cd.Index] } else { '' }
@@ -1549,8 +1626,25 @@ function Apply-Sort {
 }
 
 $script:CurrentFilter = ''
+function Get-SearchableText($item) {
+    $parts = New-Object System.Collections.Generic.List[string]
+    if ($item.DisplayName) { $parts.Add([string]$item.DisplayName) | Out-Null }
+    if ($item.Hostname) { $parts.Add([string]$item.Hostname) | Out-Null }
+    if ($item.ResolvedHost) { $parts.Add([string]$item.ResolvedHost) | Out-Null }
+    if ($item.DetectionMethod) { $parts.Add([string]$item.DetectionMethod) | Out-Null }
+    if ($item.DetectedPort -gt 0) { $parts.Add([string]$item.DetectedPort) | Out-Null }
+    if ($item.RawData) {
+        foreach ($entry in $item.RawData.GetEnumerator()) {
+            if ($entry.Value) {
+                $parts.Add([string]$entry.Value) | Out-Null
+            }
+        }
+    }
+    return ($parts.ToArray() -join ' ').ToLowerInvariant()
+}
+
 function Apply-Filter {
-    $ft = $searchBox.Text.Trim().ToLower()
+    $ft = $searchBox.Text.Trim().ToLowerInvariant()
     $script:CurrentFilter = $ft
     if (-not $ft -and $script:StatusFilter -eq 'All') {
         $script:CollView.Filter = $null
@@ -1559,8 +1653,7 @@ function Apply-Filter {
             param($obj)
             $s = [ServerItem]$obj
             $textOk = if ($script:CurrentFilter) {
-                ($s.DisplayName -and $s.DisplayName.ToLower().Contains($script:CurrentFilter)) -or
-                ($s.Hostname    -and $s.Hostname.ToLower().Contains($script:CurrentFilter))
+                (Get-SearchableText $s).Contains($script:CurrentFilter)
             } else { $true }
             $statusOk = switch ($script:StatusFilter) {
                 'Online'  { $s.Status -eq 'online' }
@@ -1628,6 +1721,30 @@ function Refresh-All {
 }
 
 # ============================== VNC CONNECT ==================================
+function Get-VncConnectTarget([string]$host, [int]$port) {
+    if ([string]::IsNullOrWhiteSpace($host)) { return $null }
+    if ($port -gt 0 -and $port -ne 5900) {
+        return ('{0}::{1}' -f $host.Trim(), $port)
+    }
+    return $host.Trim()
+}
+
+function Start-VncViewer {
+    param(
+        [string]$VncExe,
+        [string]$Username,
+        [string]$Password,
+        [string]$ConnectTarget
+    )
+
+    $argList = @()
+    if (-not [string]::IsNullOrWhiteSpace($Username)) {
+        $argList += @('-user', $Username)
+    }
+    $argList += @('-password', $Password, '-connect', $ConnectTarget)
+    return Start-Process -FilePath $VncExe -ArgumentList $argList -PassThru
+}
+
 function Connect-VNC {
     param($item)
     if (-not $item -or -not $item.Hostname) {
@@ -1635,31 +1752,6 @@ function Connect-VNC {
             "This server has no hostname configured.",
             "Cannot Connect", "OK", "Warning") | Out-Null
         return
-    }
-    $connectSpec = Get-ConnectSpec $item
-    $connectHost = $connectSpec.Host
-    if (-not $connectHost) { $connectHost = $item.Hostname }
-
-    # If still only a bare hostname (no dot), try on-the-fly DNS resolution with each suffix
-    if (-not $connectHost.Contains('.')) {
-        $dnsResolveTimeoutMs = 500
-        foreach ($suffix in $script:Config.DnsSuffixes) {
-            if ([string]::IsNullOrWhiteSpace($suffix)) { continue }
-            $candidate = "$($connectHost.Trim()).$($suffix.Trim())"
-            try {
-                $resolveTask = [System.Net.Dns]::GetHostAddressesAsync($candidate)
-                if ($resolveTask.Wait($dnsResolveTimeoutMs)) {
-                    $addresses = $resolveTask.Result
-                    if ($addresses -and $addresses.Length -gt 0) {
-                        $connectHost = $candidate
-                        $hostKey = Get-HostLookupKey $item.Hostname
-                        if ($hostKey) { $script:ResolvedHostCache[$hostKey] = $candidate }
-                        $item.ResolvedHost = $candidate
-                        break
-                    }
-                }
-            } catch {}
-        }
     }
 
     $vncExe = $script:VncExeResolved
@@ -1669,24 +1761,51 @@ function Connect-VNC {
             "VNC Not Found", "OK", "Warning") | Out-Null
         return
     }
-    $pw = $vncPasswordBox.Password
-    if ([string]::IsNullOrEmpty($pw)) {
-        $vncPasswordBox.Focus() | Out-Null
-        Show-StatusMessage "Enter VNC password before connecting"
+
+    $creds = Get-VncCredentials $false
+    if (-not $creds) {
+        Show-StatusMessage 'Connection canceled (no VNC credentials)'
         return
     }
 
+    $connectSpec = Get-ConnectSpec $item
     $port = $connectSpec.Port
     if ($port -le 0) {
         $port = (@(Get-VncPorts))[0]
     }
 
-    # UltraVNC 1.6.x standard target format is host::port.
-    # Pass as an argument array so that the password stays before -connect and special chars survive quoting.
-    $escapedPw = $pw -replace '"', '\\"'
-    $argList   = @('-password', ('"' + $escapedPw + '"'), '-connect', ('{0}::{1}' -f $connectHost, $port))
-    Start-Process -FilePath $vncExe -ArgumentList $argList
-    Show-StatusMessage ('Connecting to {0} on TCP:{1}...' -f $connectHost, $port)
+    $bareHostname = $item.Hostname.Trim()
+    $resolvedHost = $null
+    if ($item.ResolvedHost) {
+        $resolvedHost = $item.ResolvedHost.Trim()
+    } elseif ($connectSpec.Host -and $connectSpec.Host -ne $bareHostname) {
+        $resolvedHost = $connectSpec.Host.Trim()
+    }
+
+    $firstTarget = Get-VncConnectTarget -host $bareHostname -port $port
+    $fallbackTarget = $null
+    if ($resolvedHost -and $resolvedHost.ToLowerInvariant() -ne $bareHostname.ToLowerInvariant()) {
+        $fallbackTarget = Get-VncConnectTarget -host $resolvedHost -port $port
+    }
+
+    $proc = Start-VncViewer -VncExe $vncExe -Username $creds.Username -Password $creds.Password -ConnectTarget $firstTarget
+    Show-StatusMessage ('Connecting to {0} (detected TCP:{1})...' -f $bareHostname, $port)
+
+    if ($fallbackTarget) {
+        if ($proc.WaitForExit(1200)) {
+            $tryFallback = [System.Windows.MessageBox]::Show(
+                $window,
+                "Initial VNC connect ended quickly for '$bareHostname'.`nTry fallback host '$resolvedHost'?",
+                "VNC Fallback",
+                [System.Windows.MessageBoxButton]::YesNo,
+                [System.Windows.MessageBoxImage]::Question
+            )
+            if ($tryFallback -eq [System.Windows.MessageBoxResult]::Yes) {
+                Start-VncViewer -VncExe $vncExe -Username $creds.Username -Password $creds.Password -ConnectTarget $fallbackTarget | Out-Null
+                Show-StatusMessage ('Fallback connect to {0} (detected TCP:{1})...' -f $resolvedHost, $port)
+            }
+        }
+    }
 }
 
 # ============================== EVENT HANDLERS ===============================
@@ -1708,35 +1827,14 @@ $filterAllBtn.Add_Click({     Set-FilterSegment 'All'     })
 $filterOnlineBtn.Add_Click({  Set-FilterSegment 'Online'  })
 $filterOfflineBtn.Add_Click({ Set-FilterSegment 'Offline' })
 
-# VNC password box: toggle hint visibility and auto-save on change
-$vncPasswordBox.Add_PasswordChanged({
-    if (-not $script:PasswordSyncInProgress) {
-        Sync-PasswordToTextBox
+# Credentials button
+$credentialsBtn.Add_Click({
+    $updatedCreds = Get-VncCredentials $true
+    if ($updatedCreds) {
+        Show-StatusMessage 'VNC credentials saved'
+    } else {
+        Show-StatusMessage 'Credential update canceled'
     }
-    Update-PasswordHint
-    Save-Settings $vncPasswordBox.Password
-})
-
-$vncPasswordTextBox.Add_TextChanged({
-    if (-not $script:PasswordSyncInProgress) {
-        Sync-PasswordToPasswordBox
-        Save-Settings $vncPasswordTextBox.Text
-    }
-    Update-PasswordHint
-})
-
-$vncPasswordRevealBtn.Add_PreviewMouseDown({
-    $vncPasswordRevealBtn.CaptureMouse() | Out-Null
-    Show-PasswordReveal
-})
-
-$vncPasswordRevealBtn.Add_PreviewMouseUp({
-    Hide-PasswordReveal
-    $vncPasswordRevealBtn.ReleaseMouseCapture()
-})
-
-$vncPasswordRevealBtn.Add_LostMouseCapture({
-    Hide-PasswordReveal
 })
 
 # Context menu: Copy hostname
@@ -1853,13 +1951,18 @@ $window.Add_Loaded({
     } else {
         $autoRefLbl.ToolTip = "VNC viewer not found - update VncExe in config"
     }
-    # Load saved VNC password (settings file > env var > config)
-    $savedPw = Load-Settings
-    if ($savedPw) {
-        $vncPasswordBox.Password    = $savedPw
-        Sync-PasswordToTextBox
+    # Load saved VNC credentials (settings file)
+    $savedCreds = Load-Settings
+    if ($savedCreds -and -not [string]::IsNullOrWhiteSpace($savedCreds.Password)) {
+        $savedUser = ''
+        if ($savedCreds.Username) { $savedUser = [string]$savedCreds.Username }
+        $script:VncCredentials = [pscustomobject]@{
+            Username = $savedUser
+            Password = [string]$savedCreds.Password
+        }
+    } else {
+        $script:VncCredentials = $null
     }
-    Update-PasswordHint
     # Initialize filter segments (All active by default)
     Set-FilterSegment 'All'
     Refresh-All
