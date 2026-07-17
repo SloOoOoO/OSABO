@@ -29,11 +29,9 @@ $script:Config = @{
     MaxConcurrentChecks = 50
     # Per-host ping timeout in milliseconds (2000 = safer for corporate firewalls)
     PingTimeoutMs      = 2000
-    # Candidate VNC listener ports checked in order; Ford SPC uses 9506 by default.
-    # Re-add 5900 here later if a site still needs it.
-    VncPorts           = @(9506)
-    # Remote Desktop fallback port; if this alone answers, Connect launches mstsc instead of UltraVNC
-    RdpPort            = 3389
+    # VNC ports probed and used for connection, in priority order.
+    # The legacy VNC default port was intentionally removed; Ford SPC uses 9506 primary and 3389 secondary.
+    VncPorts           = @(9506, 3389)
     # Per-port TCP timeout in milliseconds (1500 = more lenient for slow networks)
     TcpFallbackTimeoutMs = 1500
 }
@@ -283,7 +281,6 @@ function Start-LiveMonitor {
     $rs.SessionStateProxy.SetVariable('maxConcurrentChecks', [Math]::Max(1, [int]$script:Config.MaxConcurrentChecks))
     $rs.SessionStateProxy.SetVariable('timeoutMs',  $script:Config.PingTimeoutMs)
     $rs.SessionStateProxy.SetVariable('vncPorts',   @(Get-VncPorts))
-    $rs.SessionStateProxy.SetVariable('rdpPort',    (Get-RdpPort))
     $rs.SessionStateProxy.SetVariable('tcpTimeoutMs', $script:Config.TcpFallbackTimeoutMs)
     $rs.SessionStateProxy.SetVariable('resultQueue', $script:PingQueue)
     $rs.SessionStateProxy.SetVariable('control', $script:MonitorControl)
@@ -299,7 +296,6 @@ param(
     [string[]]$DnsSuffixes,
     [int]$PingTimeoutMs,
     [int[]]$VncPorts,
-    [int]$RdpPort,
     [int]$TcpTimeoutMs,
     [string]$CachedResolvedHost
 )
@@ -330,7 +326,7 @@ function Get-HostCandidates([string]$BaseHostname, [string[]]$Suffixes) {
     return $candidates.ToArray()
 }
 
-function Get-TcpCandidatePorts([int[]]$Ports, [int]$FallbackRdpPort) {
+function Get-TcpCandidatePorts([int[]]$Ports) {
     $candidates = New-Object System.Collections.Generic.List[int]
     $seen = @{}
 
@@ -342,14 +338,6 @@ function Get-TcpCandidatePorts([int[]]$Ports, [int]$FallbackRdpPort) {
         if (-not $seen.ContainsKey($key)) {
             $seen[$key] = $true
             $candidates.Add($port) | Out-Null
-        }
-    }
-
-    if ($FallbackRdpPort -gt 0) {
-        $rdpKey = [string]$FallbackRdpPort
-        if (-not $seen.ContainsKey($rdpKey)) {
-            $seen[$rdpKey] = $true
-            $candidates.Add($FallbackRdpPort) | Out-Null
         }
     }
 
@@ -418,19 +406,14 @@ if ($resolvedHost) {
         $latency = [int64]$reply.RoundtripTime
     }
 
-    foreach ($candidatePort in (Get-TcpCandidatePorts -Ports $VncPorts -FallbackRdpPort $RdpPort)) {
+    foreach ($candidatePort in (Get-TcpCandidatePorts -Ports $VncPorts)) {
         $probeResult = Test-TcpPort -TargetHost $resolvedHost -Port $candidatePort -TimeoutMs $TcpTimeoutMs
         if ($probeResult) {
             $status = 'online'
             $latency = $probeResult.Latency
             $detectedPort = $probeResult.Port
-            if ($RdpPort -gt 0 -and $detectedPort -eq $RdpPort) {
-                $connectionMode = 'RDP'
-                $detectionMethod = "TCP:$detectedPort RDP"
-            } else {
-                $connectionMode = 'VNC'
-                $detectionMethod = "TCP:$detectedPort"
-            }
+            $connectionMode = 'VNC'
+            $detectionMethod = "TCP:$detectedPort"
             break
         }
     }
@@ -519,7 +502,6 @@ if ($resolvedHost) {
                             AddParameter('DnsSuffixes', $dnsSuffixes).
                             AddParameter('PingTimeoutMs', $timeoutMs).
                             AddParameter('VncPorts', $vncPorts).
-                            AddParameter('RdpPort', $rdpPort).
                             AddParameter('TcpTimeoutMs', $tcpTimeoutMs).
                             AddParameter('CachedResolvedHost', $state.CachedResolvedHost)
 
@@ -1199,17 +1181,6 @@ function Get-VncPorts {
     return $ports.ToArray()
 }
 
-function Get-RdpPort {
-    $port = 3389
-    try {
-        $configuredPort = [int]$script:Config.RdpPort
-        if ($configuredPort -gt 0) {
-            $port = $configuredPort
-        }
-    } catch {}
-    return $port
-}
-
 function Get-ConnectTarget($item) {
     if (-not $item -or -not $item.Hostname) { return $null }
     $hostKey = Get-HostLookupKey $item.Hostname
@@ -1224,13 +1195,9 @@ function Get-ConnectTarget($item) {
 
 function Get-ConnectSpec($item) {
     $port = 0
-    $mode = 'VNC'
 
     if ($item) {
         try { $port = [int]$item.DetectedPort } catch { $port = 0 }
-        if ($item.ConnectionMode) {
-            $mode = $item.ConnectionMode
-        }
     }
 
     if ($port -le 0) {
@@ -1238,13 +1205,12 @@ function Get-ConnectSpec($item) {
         if ($vncPorts.Count -gt 0) {
             $port = [int]$vncPorts[0]
         }
-        $mode = 'VNC'
     }
 
     return [pscustomobject]@{
         Host = Get-ConnectTarget $item
         Port = $port
-        Mode = $mode
+        Mode = 'VNC'
     }
 }
 
@@ -1271,12 +1237,7 @@ function Update-ActionButtons($item) {
         return
     }
 
-    $connectSpec = Get-ConnectSpec $item
-    if ($connectSpec.Mode -eq 'RDP') {
-        $connectBtn.Content = 'Connect via RDP'
-    } else {
-        $connectBtn.Content = 'Connect via VNC'
-    }
+    $connectBtn.Content = 'Connect via VNC'
 }
 
 function Show-StatusMessage([string]$message) {
@@ -1699,12 +1660,6 @@ function Connect-VNC {
                 }
             } catch {}
         }
-    }
-
-    if ($connectSpec.Mode -eq 'RDP') {
-        Start-Process -FilePath 'mstsc.exe' -ArgumentList @("/v:$connectHost")
-        Show-StatusMessage "Launching Remote Desktop for $connectHost"
-        return
     }
 
     $vncExe = $script:VncExeResolved
