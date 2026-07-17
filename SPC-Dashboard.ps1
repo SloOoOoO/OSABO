@@ -657,95 +657,6 @@ $script:ColumnDefs = @(
       </Setter>
     </Style>
 
-    <!-- VNC PasswordBox -->
-    <Style x:Key="PwdStyle" TargetType="PasswordBox">
-      <Setter Property="FontSize"          Value="13"/>
-      <Setter Property="Foreground"        Value="#1C1C1E"/>
-      <Setter Property="Background"        Value="#FFFFFF"/>
-      <Setter Property="BorderBrush"       Value="#D1D1D6"/>
-      <Setter Property="BorderThickness"   Value="1"/>
-      <Setter Property="Padding"           Value="10,7"/>
-      <Setter Property="VerticalContentAlignment" Value="Center"/>
-      <Setter Property="Template">
-        <Setter.Value>
-          <ControlTemplate TargetType="PasswordBox">
-            <Border x:Name="Bd" CornerRadius="8"
-                    Background="{TemplateBinding Background}"
-                    BorderBrush="{TemplateBinding BorderBrush}"
-                    BorderThickness="{TemplateBinding BorderThickness}">
-              <ScrollViewer x:Name="PART_ContentHost" Margin="{TemplateBinding Padding}"/>
-            </Border>
-            <ControlTemplate.Triggers>
-              <Trigger Property="IsFocused" Value="True">
-                <Setter TargetName="Bd" Property="BorderBrush" Value="#007AFF"/>
-                <Setter TargetName="Bd" Property="BorderThickness" Value="1.5"/>
-              </Trigger>
-            </ControlTemplate.Triggers>
-          </ControlTemplate>
-        </Setter.Value>
-      </Setter>
-    </Style>
-
-    <!-- Plain-text reveal TextBox -->
-    <Style x:Key="PwdRevealTextStyle" TargetType="TextBox">
-      <Setter Property="FontSize"          Value="13"/>
-      <Setter Property="Foreground"        Value="#1C1C1E"/>
-      <Setter Property="Background"        Value="#FFFFFF"/>
-      <Setter Property="BorderBrush"       Value="#D1D1D6"/>
-      <Setter Property="BorderThickness"   Value="1"/>
-      <Setter Property="Padding"           Value="10,7"/>
-      <Setter Property="VerticalContentAlignment" Value="Center"/>
-      <Setter Property="Template">
-        <Setter.Value>
-          <ControlTemplate TargetType="TextBox">
-            <Border x:Name="Bd" CornerRadius="8"
-                    Background="{TemplateBinding Background}"
-                    BorderBrush="{TemplateBinding BorderBrush}"
-                    BorderThickness="{TemplateBinding BorderThickness}">
-              <ScrollViewer x:Name="PART_ContentHost" Margin="{TemplateBinding Padding}"/>
-            </Border>
-            <ControlTemplate.Triggers>
-              <Trigger Property="IsFocused" Value="True">
-                <Setter TargetName="Bd" Property="BorderBrush" Value="#007AFF"/>
-                <Setter TargetName="Bd" Property="BorderThickness" Value="1.5"/>
-              </Trigger>
-            </ControlTemplate.Triggers>
-          </ControlTemplate>
-        </Setter.Value>
-      </Setter>
-    </Style>
-
-    <!-- Password reveal button -->
-    <Style x:Key="EyeBtn" TargetType="Button">
-      <Setter Property="Width"             Value="28"/>
-      <Setter Property="Height"            Value="28"/>
-      <Setter Property="Background"        Value="#F2F2F7"/>
-      <Setter Property="BorderBrush"       Value="#D1D1D6"/>
-      <Setter Property="BorderThickness"   Value="1"/>
-      <Setter Property="Cursor"            Value="Hand"/>
-      <Setter Property="Padding"           Value="6"/>
-      <Setter Property="Template">
-        <Setter.Value>
-          <ControlTemplate TargetType="Button">
-            <Border x:Name="Bd" CornerRadius="8"
-                    Background="{TemplateBinding Background}"
-                    BorderBrush="{TemplateBinding BorderBrush}"
-                    BorderThickness="{TemplateBinding BorderThickness}">
-              <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
-            </Border>
-            <ControlTemplate.Triggers>
-              <Trigger Property="IsMouseOver" Value="True">
-                <Setter TargetName="Bd" Property="Background" Value="#E5E5EA"/>
-              </Trigger>
-              <Trigger Property="IsPressed" Value="True">
-                <Setter TargetName="Bd" Property="Background" Value="#D1D1D6"/>
-              </Trigger>
-            </ControlTemplate.Triggers>
-          </ControlTemplate>
-        </Setter.Value>
-      </Setter>
-    </Style>
-
     <!-- ListView item container -->
     <Style x:Key="ListItem" TargetType="ListViewItem">
       <Setter Property="HorizontalContentAlignment" Value="Stretch"/>
@@ -850,12 +761,26 @@ $script:ColumnDefs = @(
           <ColumnDefinition Width="Auto"/>
         </Grid.ColumnDefinitions>
 
-        <!-- App title -->
-        <StackPanel Grid.Column="0" VerticalAlignment="Center" Margin="0,0,28,0">
-          <TextBlock Text="SPC Dashboard" FontSize="18" FontWeight="SemiBold"
-                     Foreground="#1C1C1E"/>
-          <TextBlock x:Name="SubTitle" Text="Loading..." FontSize="11"
-                     Foreground="#8E8E93"/>
+        <!-- App title with Ford oval logo -->
+        <StackPanel Grid.Column="0" VerticalAlignment="Center" Margin="0,0,28,0"
+                    Orientation="Horizontal">
+          <!-- Ford oval logo: dark-blue filled ellipse, inner white-stroke ring, italic Ford text -->
+          <Grid Width="56" Height="23" VerticalAlignment="Center" Margin="0,0,10,0">
+            <Ellipse Fill="#003478"/>
+            <Ellipse Stroke="White" StrokeThickness="1.4" Fill="Transparent"
+                     Width="46" Height="15" HorizontalAlignment="Center" VerticalAlignment="Center"/>
+            <TextBlock Text="Ford" FontFamily="Palatino Linotype"
+                       FontStyle="Italic" FontWeight="Bold"
+                       FontSize="12" Foreground="White"
+                       HorizontalAlignment="Center" VerticalAlignment="Center"/>
+          </Grid>
+          <!-- Title text -->
+          <StackPanel VerticalAlignment="Center">
+            <TextBlock Text="SPC Dashboard" FontSize="18" FontWeight="SemiBold"
+                       Foreground="#1C1C1E"/>
+            <TextBlock x:Name="SubTitle" Text="Loading..." FontSize="11"
+                       Foreground="#8E8E93"/>
+          </StackPanel>
         </StackPanel>
 
         <!-- Search -->
@@ -1085,6 +1010,17 @@ $script:StatusMessageTimer.Add_Tick({
     $script:StatusMessage = $null
     Update-StatusBar
 })
+
+# Debounce timer for search: waits 250 ms of idle before applying filter
+$script:SearchTimer = New-Object System.Windows.Threading.DispatcherTimer
+$script:SearchTimer.Interval = [TimeSpan]::FromMilliseconds(250)
+$script:SearchTimer.Add_Tick({
+    $script:SearchTimer.Stop()
+    Apply-Filter
+})
+
+# Pre-computed search strings per ServerItem (populated at load time)
+$script:SearchCache = @{}
 
 # ====================== SETTINGS (credentials persistence) ===================
 $script:SettingsDir  = Join-Path $env:APPDATA 'SPC-Dashboard'
@@ -1351,7 +1287,13 @@ function Show-CredentialsDialog {
     })
 
     $dialog.ShowDialog() | Out-Null
-    return $result
+    if ($dialog.DialogResult -eq $true) {
+        return [pscustomobject]@{
+            Username = $usernameBox.Text
+            Password = $passwordBox.Password
+        }
+    }
+    return $null
 }
 
 function Get-VncCredentials([bool]$ForcePrompt) {
@@ -1630,21 +1572,23 @@ function Apply-Sort {
 }
 
 $script:CurrentFilter = ''
-function Get-SearchableText($item) {
+function Compute-SearchString($item) {
     $parts = New-Object System.Collections.Generic.List[string]
     if ($item.DisplayName) { $parts.Add([string]$item.DisplayName) | Out-Null }
-    if ($item.Hostname) { $parts.Add([string]$item.Hostname) | Out-Null }
-    if ($item.ResolvedHost) { $parts.Add([string]$item.ResolvedHost) | Out-Null }
-    if ($item.DetectionMethod) { $parts.Add([string]$item.DetectionMethod) | Out-Null }
-    if ($item.DetectedPort -gt 0) { $parts.Add([string]$item.DetectedPort) | Out-Null }
+    if ($item.Hostname)    { $parts.Add([string]$item.Hostname)    | Out-Null }
     if ($item.RawData) {
         foreach ($entry in $item.RawData.GetEnumerator()) {
-            if ($entry.Value) {
-                $parts.Add([string]$entry.Value) | Out-Null
-            }
+            if ($entry.Value) { $parts.Add([string]$entry.Value) | Out-Null }
         }
     }
     return ($parts.ToArray() -join ' ').ToLowerInvariant()
+}
+
+function Get-SearchableText($item) {
+    if ($script:SearchCache.ContainsKey($item)) {
+        return $script:SearchCache[$item]
+    }
+    return Compute-SearchString $item
 }
 
 function Apply-Filter {
@@ -1680,6 +1624,7 @@ function Load-Servers {
     }
     $script:ServerCollection.Clear()
     $script:ServerLookup.Clear()
+    $script:SearchCache = @{}
     foreach ($item in $items) {
         $script:ServerCollection.Add($item) | Out-Null
         $key = Get-HostLookupKey $item.Hostname
@@ -1689,6 +1634,7 @@ function Load-Servers {
             }
             $script:ServerLookup[$key].Add($item) | Out-Null
         }
+        $script:SearchCache[$item] = Compute-SearchString $item
     }
     Apply-Sort
     Apply-Filter
@@ -1744,11 +1690,16 @@ function Start-VncViewer {
     if ([string]::IsNullOrWhiteSpace($VncExe)) {
         throw "VNC viewer path is empty."
     }
+    if ([string]::IsNullOrWhiteSpace($Password)) {
+        throw "VNC password is required."
+    }
     $argList = @()
     if (-not [string]::IsNullOrWhiteSpace($Username)) {
-        $argList += @('-user', $Username)
+        $argList += @('-user', $Username.Trim())
     }
     $argList += @('-password', $Password, '-connect', $ConnectTarget)
+    # Safety: remove any null or empty elements that would cause ArgumentList validation to fail
+    $argList = @($argList | Where-Object { $_ -ne $null -and $_ -ne '' })
     $exeName = [System.IO.Path]::GetFileName($VncExe)
     $logArgs = @()
     if (-not [string]::IsNullOrWhiteSpace($Username)) {
@@ -1836,10 +1787,11 @@ function Connect-VNC {
 
 # ============================== EVENT HANDLERS ===============================
 
-# Search box
+# Search box - debounced 250 ms so fast typing does not block the UI
 $searchBox.Add_TextChanged({
     $searchHint.Visibility = if ($searchBox.Text) { 'Collapsed' } else { 'Visible' }
-    Apply-Filter
+    $script:SearchTimer.Stop()
+    $script:SearchTimer.Start()
 })
 
 # Sort
@@ -1997,6 +1949,8 @@ $window.Add_Loaded({
 
 $window.Add_Closed({
     $pingTimer.Stop()
+    $script:SearchTimer.Stop()
+    $script:StatusMessageTimer.Stop()
     if ($script:WatcherRegistered) {
         Unregister-Event -SourceIdentifier 'SPC_ExcelChanged' -ErrorAction SilentlyContinue
         $script:Watcher.Dispose()
